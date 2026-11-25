@@ -38,7 +38,7 @@
 <video id="vid" playsinline muted autoplay></video>
 <div id="panel">
   <b>VR</b>
-  <div class="s">黄色い十字が、それぞれのレンズの真ん中に来るように合わせてください（押し続けると連続で動きます）。<br>ゴーグルの中で：画面を1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
+  <div class="s">黄色い十字が、それぞれのレンズの真ん中に来るように合わせてください（押し続けると連続で動きます）。<br>ゴーグルの中で：画面の<b style="font-size:12px">中央の上の方を押している間 → 向いている方へ歩く</b>／ほかを1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
   <div class="modes" id="modes"><div data-m="river">夜の川辺</div><div data-m="sunset">夕焼けの海</div><div data-m="meadow">昼の草原</div><div data-m="space">宇宙</div><div data-m="cam">カメラ</div></div>
   <div class="modes" id="togs"><div data-t="snow">雪</div><div data-t="me">自分を映す</div></div>
   <div id="ctl"></div>
@@ -50,7 +50,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-25.7";
+const VERSION = "2026-11-25.8";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -150,7 +150,7 @@ precision highp float;
 uniform vec2 uRes, uMm, uCamTan;
 uniform float uSep, uVy, uDist, uK1, uK2, uMaxTan, uOff, uT, uEyeH, uCamOk, uMe, uMaskOk;
 uniform vec2 uSegTh;
-uniform vec3 uR, uU, uF;
+uniform vec3 uR, uU, uF, uPos;
 uniform int uMode, uScene;
 uniform sampler2D uCam, uMask;
 out vec4 o;
@@ -376,7 +376,7 @@ void main() {
     return;
   }
   vec3 dir = normalize(uF + uR * tu.x + uU * tu.y);
-  vec3 eye = uR * side * uOff;
+  vec3 eye = uPos + uR * side * uOff;
   vec3 c = uScene == 1 ? shadeSunset(eye, dir) : uScene == 2 ? shadeMeadow(eye, dir) : uScene == 3 ? skySpace(dir) : shade(eye, dir);
   c = clamp(c, 0.0, 255.0) / 255.0;
   // "me": where the cutout says there is a body, show the camera picture instead
@@ -395,11 +395,11 @@ const VS_SNOW = `#version 300 es
 in vec3 aP;
 uniform vec2 uMm;
 uniform float uSep, uVy, uDist, uK1, uK2, uOff, uSide, uPxMm, uFlake, uMaxTan;
-uniform vec3 uR, uU, uF;
+uniform vec3 uR, uU, uF, uPos;
 out float vA;
 void main() {
   gl_Position = vec4(2.0, 2.0, 0.0, 1.0); gl_PointSize = 0.0; vA = 0.0;
-  vec3 rel = aP - uR * uSide * uOff;
+  vec3 rel = aP - uPos - uR * uSide * uOff;
   float cz = dot(rel, uF);
   if (cz < 0.3) return;
   vec2 t = vec2(dot(rel, uR), dot(rel, uU)) / cz;
@@ -521,11 +521,25 @@ const flakes = [];
 function rnd(a, b) { return a + Math.random() * (b - a); }
 for (let i = 0; i < SNOW_N; i++) flakes.push({ x: rnd(-14, 14), y: rnd(-EYE_HEIGHT, 9), z: rnd(-14, 14), v: rnd(0.5, 1.1), p: rnd(0, 6.28) });
 let T = 0;
+/* ---------- walking: while the top-middle of the screen is held, move the way you face ---------- */
+const WALK_SPEED = 1.4;                 // metres per second (a normal walk)
+const WALK_ZONE = { w: 0.4, h: 0.35 };  // the touch area: middle 40% of the width, top 35% of the height
+let pos = [0, 0, 0], walking = 0;
+function inWalkZone(x, y) { return Math.abs(x / innerWidth - 0.5) < WALK_ZONE.w / 2 && y / innerHeight < WALK_ZONE.h; }
+function stepWalk(dt, F) {
+  if (!walking) return;
+  const l = Math.hypot(F[0], F[2]);
+  if (l < 0.2) return;                  // looking straight up or down: don't move
+  pos[0] += F[0] / l * WALK_SPEED * dt; pos[2] += F[2] / l * WALK_SPEED * dt;
+}
 function stepSnow(dt) {
   flakes.forEach((f, i) => {
     f.y -= f.v * dt;
     f.x += Math.sin(T * 0.7 + f.p) * 0.25 * dt;
-    if (f.y < -EYE_HEIGHT) { f.y = 9; f.x = rnd(-14, 14); f.z = rnd(-14, 14); }
+    if (f.y < -EYE_HEIGHT) { f.y = 9; f.x = pos[0] + rnd(-14, 14); f.z = pos[2] + rnd(-14, 14); }
+    // keep the snow around you while you walk
+    if (f.x - pos[0] > 14) f.x -= 28; else if (f.x - pos[0] < -14) f.x += 28;
+    if (f.z - pos[2] > 14) f.z -= 28; else if (f.z - pos[2] < -14) f.z += 28;
     snowPos[i * 3] = f.x; snowPos[i * 3 + 1] = f.y; snowPos[i * 3 + 2] = f.z;
   });
 }
@@ -574,7 +588,8 @@ function frame(now) {
   gl.useProgram(P.p); const u = P.u;
   setLens(u);
   gl.uniform2f(u.uRes, cv.width, cv.height);
-  gl.uniform3f(u.uR, ...R); gl.uniform3f(u.uU, ...U); gl.uniform3f(u.uF, ...F);
+  stepWalk(dt, F);
+  gl.uniform3f(u.uR, ...R); gl.uniform3f(u.uU, ...U); gl.uniform3f(u.uF, ...F); gl.uniform3f(u.uPos, ...pos);
   gl.uniform1f(u.uT, T); gl.uniform1f(u.uEyeH, EYE_HEIGHT);
   gl.uniform1i(u.uMode, cam ? 1 : 0); gl.uniform1f(u.uCamOk, camOk);
   gl.uniform1i(u.uScene, Math.max(0, PLACES.indexOf(S.place)));
@@ -592,7 +607,7 @@ function frame(now) {
     gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(PS.p); const v = PS.u;
     setLens(v);
-    gl.uniform3f(v.uR, ...R); gl.uniform3f(v.uU, ...U); gl.uniform3f(v.uF, ...F);
+    gl.uniform3f(v.uR, ...R); gl.uniform3f(v.uU, ...U); gl.uniform3f(v.uF, ...F); gl.uniform3f(v.uPos, ...pos);
     gl.uniform1f(v.uPxMm, cv.width / mmW); gl.uniform1f(v.uFlake, FLAKE);
     gl.bindVertexArray(vaoSnow);
     gl.bindBuffer(gl.ARRAY_BUFFER, snowBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, snowPos);
@@ -678,6 +693,7 @@ function drawGuide() {
 addEventListener("resize", drawGuide);
 for (const b of document.querySelectorAll("#modes div")) b.addEventListener("click", () => {
   S.place = b.dataset.m; save(); showVals(); syncCam();
+  pos = [0, 0, 0];                      // a new place: start at its usual spot
 });
 for (const b of document.querySelectorAll("#togs div")) b.addEventListener("click", () => {
   S[b.dataset.t] = !S[b.dataset.t]; save(); showVals(); syncCam();
@@ -713,9 +729,15 @@ document.getElementById("go").addEventListener("click", async () => {
   drawGuide();
 });
 
-/* ---------- touch: drag to look (PC / no sensor), 1 tap = adjust panel, 2 taps = recenter ---------- */
+/* ---------- touch: hold the top-middle = walk, drag elsewhere = look (PC / no sensor),
+   1 tap = adjust panel, 2 taps = recenter ---------- */
 let drag = null, tapTimer = 0, lastTap = 0;
-cv.addEventListener("pointerdown", e => { drag = { x: e.clientX, y: e.clientY, yaw: dragYaw, pitch: dragPitch, moved: false }; });
+const walkers = new Set();
+cv.addEventListener("pointerdown", e => {
+  if (window.started && inWalkZone(e.clientX, e.clientY)) { walkers.add(e.pointerId); walking = walkers.size; return; }
+  drag = { x: e.clientX, y: e.clientY, yaw: dragYaw, pitch: dragPitch, moved: false };
+});
+for (const ev of ["pointerup", "pointercancel"]) addEventListener(ev, e => { if (walkers.delete(e.pointerId)) walking = walkers.size; });
 addEventListener("pointermove", e => {
   if (!drag) return;
   if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 8) drag.moved = true;
@@ -724,7 +746,8 @@ addEventListener("pointermove", e => {
   dragPitch = Math.max(-1.4, Math.min(1.4, drag.pitch + (e.clientY - drag.y) * 0.005));
 });
 cv.addEventListener("pointerup", () => {
-  const moved = drag && drag.moved; drag = null;
+  if (!drag) return;                    // the finger was walking
+  const moved = drag.moved; drag = null;
   if (moved || !window.started) return;
   const n = performance.now();
   if (n - lastTap < 350) { clearTimeout(tapTimer); lastTap = 0; doRecenter(); return; }
