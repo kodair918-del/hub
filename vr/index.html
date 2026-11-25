@@ -50,7 +50,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-25.8";
+const VERSION = "2026-11-25.9";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -522,7 +522,7 @@ function rnd(a, b) { return a + Math.random() * (b - a); }
 for (let i = 0; i < SNOW_N; i++) flakes.push({ x: rnd(-14, 14), y: rnd(-EYE_HEIGHT, 9), z: rnd(-14, 14), v: rnd(0.5, 1.1), p: rnd(0, 6.28) });
 let T = 0;
 /* ---------- walking: while the top-middle of the screen is held, move the way you face ---------- */
-const WALK_SPEED = 1.4;                 // metres per second (a normal walk)
+const WALK_SPEED = 4.5;                 // metres per second (a light run; a walk is 1.4)
 const WALK_ZONE = { w: 0.4, h: 0.35 };  // the touch area: middle 40% of the width, top 35% of the height
 let pos = [0, 0, 0], walking = 0;
 function inWalkZone(x, y) { return Math.abs(x / innerWidth - 0.5) < WALK_ZONE.w / 2 && y / innerHeight < WALK_ZONE.h; }
