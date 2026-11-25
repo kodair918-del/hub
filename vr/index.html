@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<title>VR</title>
+<style>
+  html, body { margin:0; height:100%; background:#000; overflow:hidden; touch-action:none; -webkit-user-select:none; user-select:none; }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; height:100dvh; image-rendering:pixelated; image-rendering:crisp-edges; }
+  #start { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; background:rgba(0,0,0,.82); color:#e8e6e1; font-family:system-ui, -apple-system, "Hiragino Sans", sans-serif; text-align:center; padding:24px; }
+  #start b { font-size:22px; }
+  #start .s { font-size:14px; color:#9aa0ab; line-height:1.7; }
+  #start .go { margin-top:8px; padding:14px 28px; border-radius:14px; background:#7fb4ff; color:#0b0b0a; font-weight:bold; font-size:18px; }
+  #start.off { display:none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="start">
+  <b>夜の川辺</b>
+  <div class="s">スマホを横向きにして、ゴーグルに入れてください。<br>首を動かすと見回せます。画面をダブルタップすると、いま向いている方が正面になります。</div>
+  <div class="go" id="go">はじめる</div>
+  <div class="s" id="note"></div>
+</div>
+<script>
+"use strict";
+/* ---------- settings (tunable) ---------- */
+const EYE_H = 180;          // render height per eye in pixels (lower = chunkier pixels, faster)
+const TAN_Y = 1.0;          // vertical half-FOV as tan (1.0 = 90 deg total)
+const IPD = 0.064;          // distance between the eyes in metres
+const EYE_HEIGHT = 1.6;     // how high the eyes are above the snow
+const SNOW_N = 450;         // snowflakes
+
+/* ---------- small math ---------- */
+const PI = Math.PI;
+function qMul(a, b) {
+  return [a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1],
+          a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0],
+          a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3],
+          a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2]];
+}
+function qAxis(x, y, z, ang) { const s = Math.sin(ang/2); return [x*s, y*s, z*s, Math.cos(ang/2)]; }
+function qRot(q, x, y, z) {
+  const [qx, qy, qz, qw] = q;
+  const ix = qw*x + qy*z - qz*y, iy = qw*y + qz*x - qx*z, iz = qw*z + qx*y - qy*x, iw = -qx*x - qy*y - qz*z;
+  return [ix*qw + iw*-qx + iy*-qz - iz*-qy, iy*qw + iw*-qy + iz*-qx - ix*-qz, iz*qw + iw*-qz + ix*-qy - iy*-qx];
+}
+function hash3(x, y, z) {
+  let h = (x * 374761393 + y * 668265263 + z * 2147483647) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+/* ---------- head orientation ---------- */
+// The phone's sensor angles become a rotation for a camera looking out of the back of the screen (as three.js does it).
+let devQ = null, hasGyro = false;
+let recenter = [0, 0, 0, 1];
+let dragYaw = 0, dragPitch = 0;
+const Q_BACK = [-Math.SQRT1_2, 0, 0, Math.SQRT1_2];   // -90 deg about X
+function onOrient(e) {
+  if (e.alpha == null) return;
+  hasGyro = true;
+  const d = PI / 180, x = e.beta * d, y = e.alpha * d, z = -e.gamma * d;
+  const c1 = Math.cos(x/2), c2 = Math.cos(y/2), c3 = Math.cos(z/2), s1 = Math.sin(x/2), s2 = Math.sin(y/2), s3 = Math.sin(z/2);
+  let q = [s1*c2*c3 + c1*s2*s3, c1*s2*c3 - s1*c2*s3, c1*c2*s3 - s1*s2*c3, c1*c2*c3 + s1*s2*s3];   // Euler YXZ
+  q = qMul(q, Q_BACK);
+  const ang = ((screen.orientation && screen.orientation.angle) || window.orientation || 0) * d;
+  devQ = qMul(q, qAxis(0, 0, 1, -ang));
+}
+function headQ() {
+  if (hasGyro && devQ) return qMul(recenter, devQ);
+  return qMul(qAxis(0, 1, 0, dragYaw), qAxis(1, 0, 0, dragPitch));
+}
+function doRecenter() {
+  if (!devQ) { dragYaw = 0; dragPitch = 0; return; }
+  const f = qRot(devQ, 0, 0, -1);
+  recenter = qAxis(0, 1, 0, -Math.atan2(-f[0], -f[2]));
+}
+
+/* ---------- the scene: night sky, mountains, a river in the snow ---------- */
+const MOON = (() => { const v = [0.45, 0.42, -0.79], l = Math.hypot(...v); return v.map(a => a / l); })();
+const MOON_COS = Math.cos(2.4 * PI / 180), GLOW_COS = Math.cos(9 * PI / 180);
+const DEG = PI / 180;
+function farH(az) { return (6.5 + 3 * Math.sin(3*az + 1) + 2 * Math.sin(7*az + 2) + 0.8 * Math.sin(17*az)) * DEG; }
+function nearH(az) { return (2.8 + 2.2 * Math.sin(5*az + 4) + 1.3 * Math.sin(11*az + 1) + 0.5 * Math.sin(29*az)) * DEG; }
+
+let T = 0;
+// colour of what lies in direction (dx,dy,dz) far away (sky, stars, moon, mountains) -> [r,g,b]
+function sky(dx, dy, dz, out) {
+  const el = Math.asin(Math.max(-1, Math.min(1, dy)));
+  const az = Math.atan2(dx, -dz);
+  const hn = nearH(az);
+  if (el < hn) {
+    if (el < 0) { out[0] = 20; out[1] = 26; out[2] = 48; return; }
+    out[0] = 13; out[1] = 17; out[2] = 30; return;
+  }
+  const hf = farH(az);
+  if (el < hf) {
+    if (hf > 9 * DEG && el > hf - 1.3 * DEG) { out[0] = 120; out[1] = 132; out[2] = 165; return; }
+    out[0] = 26; out[1] = 32; out[2] = 56; return;
+  }
+  // sky gradient
+  const k = Math.min(1, Math.max(0, el / (PI / 2)));
+  let r = 24 - 18 * k, g = 32 - 24 * k, b = 64 - 40 * k;
+  // moon and its glow
+  const m = dx * MOON[0] + dy * MOON[1] + dz * MOON[2];
+  if (m > MOON_COS) { out[0] = 236; out[1] = 230; out[2] = 196; return; }
+  if (m > GLOW_COS) { const gl = (m - GLOW_COS) / (MOON_COS - GLOW_COS); r += 40 * gl * gl; g += 40 * gl * gl; b += 46 * gl * gl; }
+  // stars: a fixed grid on the sphere, a few cells lit, each twinkling at its own pace
+  const N = 150, ix = Math.floor((dx + 1) * N), iy = Math.floor((dy + 1) * N), iz = Math.floor((dz + 1) * N);
+  const h = hash3(ix, iy, iz);
+  if (h < 0.012 + 0.01 * k) {
+    const ph = hash3(iz, ix, iy) * 6.283, br = 0.55 + 0.45 * Math.sin(T * (1 + h * 160) + ph);
+    const s = (140 + 115 * hash3(iy, iz, ix)) * br;
+    r = Math.max(r, s); g = Math.max(g, s); b = Math.max(b, s * 1.05);
+  }
+  out[0] = r; out[1] = g; out[2] = b;
+}
+
+function riverZ(x) { return -9 + 2.2 * Math.sin(x * 0.045 + 0.6) + 0.8 * Math.sin(x * 0.13); }
+const RIVER_HALF = 2.6;
+const tmp = [0, 0, 0];
+// colour seen from eye (ex,ey,ez) along unit direction (dx,dy,dz)
+function shade(ex, ey, ez, dx, dy, dz, out) {
+  if (dy >= -0.002) { sky(dx, dy, dz, out); return; }
+  const t = (ey + EYE_HEIGHT) / -dy;            // the snow is at y = -EYE_HEIGHT
+  const px = ex + dx * t, pz = ez + dz * t;
+  const fog = 1 - Math.exp(-t / 70);
+  const zc = riverZ(px), dist = Math.abs(pz - zc);
+  let r, g, b;
+  if (dist < RIVER_HALF) {
+    // water: the sky mirrored, rippling
+    const wob = 0.018 * Math.sin(px * 1.7 + T * 1.6) + 0.012 * Math.sin(pz * 2.3 - T * 1.1);
+    sky(dx + wob, -dy, dz, tmp);
+    r = tmp[0] * 0.55 + 4; g = tmp[1] * 0.6 + 8; b = tmp[2] * 0.7 + 16;
+    // flowing glints
+    const gl = hash3(Math.floor(px * 3 - T * 4), Math.floor(pz * 6), 7);
+    if (gl > 0.985) { r += 40; g += 46; b += 60; }
+  } else if (dist < RIVER_HALF + 0.35) {
+    r = 30; g = 34; b = 44;                     // the dark bank
+  } else {
+    const n = (hash3(Math.floor(px * 2), Math.floor(pz * 2), 3) - 0.5) * 14;
+    r = 118 + n; g = 128 + n; b = 158 + n;      // moonlit snow
+  }
+  // fade toward the horizon colour
+  out[0] = r + (20 - r) * fog; out[1] = g + (26 - g) * fog; out[2] = b + (48 - b) * fog;
+}
+
+/* ---------- snow ---------- */
+const flakes = [];
+function rnd(a, b) { return a + Math.random() * (b - a); }
+for (let i = 0; i < SNOW_N; i++) flakes.push({ x: rnd(-14, 14), y: rnd(-EYE_HEIGHT, 9), z: rnd(-14, 14), v: rnd(0.5, 1.1), p: rnd(0, 6.28) });
+function stepSnow(dt) {
+  for (const f of flakes) {
+    f.y -= f.v * dt;
+    f.x += Math.sin(T * 0.7 + f.p) * 0.25 * dt;
+    if (f.y < -EYE_HEIGHT) { f.y = 9; f.x = rnd(-14, 14); f.z = rnd(-14, 14); }
+  }
+}
+
+/* ---------- rendering ---------- */
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+let W = 0, H = 0, img = null, px32 = null;
+function resize() {
+  const aspect = (innerWidth / 2) / innerHeight;
+  H = EYE_H; W = Math.max(40, Math.round(H * aspect));
+  cv.width = W * 2; cv.height = H;
+  img = ctx.createImageData(W * 2, H);
+  px32 = new Uint32Array(img.data.buffer);
+}
+addEventListener("resize", resize);
+resize();
+
+const col = [0, 0, 0];
+function renderEye(q, side) {
+  const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
+  const off = side * IPD / 2;
+  const ex = R[0] * off, ey = R[1] * off, ez = R[2] * off;
+  const tanX = TAN_Y * W / H, x0 = side < 0 ? 0 : W;
+  for (let j = 0; j < H; j++) {
+    const v = (1 - 2 * (j + 0.5) / H) * TAN_Y;
+    const bx = F[0] + U[0] * v, by = F[1] + U[1] * v, bz = F[2] + U[2] * v;
+    let o = j * W * 2 + x0;
+    for (let i = 0; i < W; i++) {
+      const u = (2 * (i + 0.5) / W - 1) * tanX;
+      let dx = bx + R[0] * u, dy = by + R[1] * u, dz = bz + R[2] * u;
+      const l = 1 / Math.sqrt(dx*dx + dy*dy + dz*dz); dx *= l; dy *= l; dz *= l;
+      shade(ex, ey, ez, dx, dy, dz, col);
+      px32[o++] = 0xff000000 | (Math.min(255, col[2]) << 16) | (Math.min(255, col[1]) << 8) | Math.min(255, col[0]);
+    }
+  }
+  // snowflakes, seen from this eye (near ones bigger, and shifted between the eyes = depth)
+  for (const f of flakes) {
+    const rx = f.x - ex, ry = f.y - ey, rz = f.z - ez;
+    const cz = rx * F[0] + ry * F[1] + rz * F[2];
+    if (cz < 0.3) continue;
+    const cx = rx * R[0] + ry * R[1] + rz * R[2], cy = rx * U[0] + ry * U[1] + rz * U[2];
+    const sx = Math.floor((cx / cz / tanX * 0.5 + 0.5) * W), sy = Math.floor((0.5 - cy / cz / TAN_Y * 0.5) * H);
+    const sz = cz < 2.5 ? 2 : 1;
+    for (let yy = 0; yy < sz; yy++) for (let xx = 0; xx < sz; xx++) {
+      const X = sx + xx, Y = sy + yy;
+      if (X >= 0 && X < W && Y >= 0 && Y < H) px32[Y * W * 2 + x0 + X] = 0xfff4eee8;
+    }
+  }
+  // the line between the eyes
+  if (side > 0) for (let j = 0; j < H; j++) px32[j * W * 2 + W] = 0xff000000;
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now; T += dt;
+  stepSnow(dt);
+  const q = headQ();
+  renderEye(q, -1);
+  renderEye(q, +1);
+  ctx.putImageData(img, 0, 0);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+/* ---------- start, permissions, input ---------- */
+let wake = null;
+async function keepAwake() {
+  try { if (navigator.wakeLock) wake = await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && wake) keepAwake(); });
+document.getElementById("go").addEventListener("click", async () => {
+  try {
+    if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
+      const r = await DeviceOrientationEvent.requestPermission();
+      if (r !== "granted") document.getElementById("note").textContent = "首の動きが許可されませんでした。指でドラッグして見回せます。";
+    }
+  } catch (e) {}
+  addEventListener("deviceorientation", onOrient);
+  keepAwake();
+  document.getElementById("start").classList.add("off");
+  setTimeout(doRecenter, 400);
+});
+// drag to look (PC, or when the sensor is not allowed)
+let drag = null;
+cv.addEventListener("pointerdown", e => { drag = { x: e.clientX, y: e.clientY, yaw: dragYaw, pitch: dragPitch }; });
+addEventListener("pointermove", e => {
+  if (!drag || hasGyro) return;
+  dragYaw = drag.yaw + (e.clientX - drag.x) * 0.005;
+  dragPitch = Math.max(-1.4, Math.min(1.4, drag.pitch + (e.clientY - drag.y) * 0.005));
+});
+addEventListener("pointerup", () => { drag = null; });
+let lastTap = 0;
+cv.addEventListener("pointerup", () => { const n = performance.now(); if (n - lastTap < 350) doRecenter(); lastTap = n; });
+</script>
+</body>
+</html>
