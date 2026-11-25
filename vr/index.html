@@ -21,13 +21,22 @@
   .btns div { flex:1; text-align:center; padding:11px 0; border-radius:12px; font-weight:bold; font-size:15px; }
   #go { background:#7fb4ff; color:#0b0b0a; }
   #reset { background:#252832; flex:0 0 7em !important; font-weight:normal !important; }
+  .modes { display:flex; gap:6px; margin:6px 0 8px; }
+  .modes div { flex:1; text-align:center; padding:8px 0; border-radius:10px; background:#252832; font-size:13px; }
+  .modes div.on { background:#7fb4ff; color:#0b0b0a; font-weight:bold; }
+  #camrow { display:none; }
+  #camrow.on { display:grid; }
+  video { position:fixed; width:1px; height:1px; opacity:0; pointer-events:none; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<video id="vid" playsinline muted autoplay></video>
 <div id="panel">
   <b>夜の川辺</b>
   <div class="s">横向きにしてゴーグルに入れると、首の動きで見回せます。左右の丸がそれぞれのレンズの真ん中に来るように合わせてください。<br>ゴーグルの中で：画面を1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
+  <div class="modes" id="modes"><div data-m="scene">夜の川辺</div><div data-m="cam">カメラ</div><div data-m="camsnow">カメラ＋雪</div></div>
+  <div class="row" id="camrow"><span>カメラの大きさ</span><input id="zoom" type="range" min="0.6" max="1.6" step="0.02"><span id="zoomv"></span></div>
   <div class="row"><span>レンズの間隔</span><input id="sep" type="range" min="50" max="75" step="0.5"><span id="sepv"></span></div>
   <div class="row"><span>上下の位置</span><input id="vy" type="range" min="-15" max="15" step="0.5"><span id="vyv"></span></div>
   <div class="row"><span>ゆがみ補正</span><input id="k" type="range" min="0" max="2" step="0.05"><span id="kv"></span></div>
@@ -46,7 +55,9 @@ const SNOW_N = 450;         // snowflakes
 const K1 = 0.34, K2 = 0.55; // lens distortion (Cardboard's usual values), scaled by the "ゆがみ補正" slider
 const MAX_TAN = 1.25;       // beyond this angle from the lens centre, draw black
 // the viewer: lens spacing (mm), lens centre up/down from the screen middle (mm), distortion scale, screen-to-lens distance (mm)
-const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39 };
+// zoom: camera picture size (1 = true size, as the iPhone's 1x camera sees it); mode: scene | cam | camsnow
+const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39, zoom: 1, mode: "scene" };
+const CAM_TAN_H = Math.tan(34 * Math.PI / 180);   // half of the 1x camera's horizontal view (about 68 deg across)
 let S = Object.assign({}, DEFAULTS);
 try { Object.assign(S, JSON.parse(localStorage.getItem("vrcfg") || "{}")); } catch (e) {}
 function save() { try { localStorage.setItem("vrcfg", JSON.stringify(S)); } catch (e) {} }
@@ -218,13 +229,59 @@ function toPixel(side, tx, ty) {
 addEventListener("resize", build);
 build();
 
+/* ---------- the camera: one picture, shown to both eyes through the same lens correction ---------- */
+const vid = document.getElementById("vid");
+const camCv = document.createElement("canvas"), camCtx = camCv.getContext("2d", { willReadFrequently: true });
+let camOn = false, camLut = null, camKey = "", camW = 0, camH = 0;
+async function startCam() {
+  if (camOn) return true;
+  try {
+    const st = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    vid.srcObject = st; await vid.play(); camOn = true; return true;
+  } catch (e) {
+    document.getElementById("note").textContent = "カメラが使えませんでした（" + (e.name || e) + "）。設定 → Safari → カメラ を「許可」にしてください。";
+    return false;
+  }
+}
+function stopCam() {
+  if (!camOn) return;
+  for (const t of vid.srcObject.getTracks()) t.stop();
+  vid.srcObject = null; camOn = false;
+}
+// which camera pixel each screen pixel shows (-1 = outside the picture)
+function camTable() {
+  const vw = vid.videoWidth, vh = vid.videoHeight;
+  if (!vw || !vh) return false;
+  const sc = Math.min(1, 320 / vw);            // read a small copy: chunky pixels, and fast
+  camW = Math.round(vw * sc); camH = Math.round(vh * sc);
+  const key = camW + "x" + camH + "|" + W + "x" + H + "|" + S.zoom + "|" + S.sep + "|" + S.vy + "|" + S.k + "|" + S.dist;
+  if (key === camKey) return true;
+  camKey = key; camCv.width = camW; camCv.height = camH;
+  const th = CAM_TAN_H / S.zoom, tv = th * vh / vw;
+  camLut = new Int32Array(W * H);
+  for (let k = 0; k < W * H; k++) {
+    if (lutS[k] === 0) { camLut[k] = -1; continue; }
+    const x = 0.5 + lutU[k] / (2 * th), y = 0.5 - lutV[k] / (2 * tv);
+    camLut[k] = x < 0 || x >= 1 || y < 0 || y >= 1 ? -1 : Math.floor(y * camH) * camW + Math.floor(x * camW);
+  }
+  return true;
+}
+function renderCam() {
+  if (!camOn || vid.readyState < 2 || !camTable()) { px32.fill(0xff000000); return; }
+  camCtx.drawImage(vid, 0, 0, camW, camH);
+  const src = new Uint32Array(camCtx.getImageData(0, 0, camW, camH).data.buffer);
+  const n = W * H;
+  for (let k = 0; k < n; k++) { const c = camLut[k]; px32[k] = c < 0 ? 0xff000000 : src[c]; }
+}
+
 const col = [0, 0, 0];
 function render(q) {
   const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
   const o = IPD / 2;
   const eL = [-R[0] * o, -R[1] * o, -R[2] * o], eR = [R[0] * o, R[1] * o, R[2] * o];
   const n = W * H;
-  for (let k = 0; k < n; k++) {
+  if (S.mode !== "scene") renderCam();
+  for (let k = 0; k < n && S.mode === "scene"; k++) {
     const s = lutS[k];
     if (s === 0) { px32[k] = 0xff000000; continue; }
     const u = lutU[k], v = lutV[k], e = s < 0 ? eL : eR;
@@ -234,6 +291,7 @@ function render(q) {
     px32[k] = 0xff000000 | (Math.min(255, col[2]) << 16) | (Math.min(255, col[1]) << 8) | Math.min(255, col[0]);
   }
   // snowflakes for each eye (near ones bigger, shifted between the eyes = depth)
+  if (S.mode === "cam") return;
   for (const side of [-1, 1]) {
     const e = side < 0 ? eL : eR;
     for (const f of flakes) {
@@ -261,8 +319,17 @@ requestAnimationFrame(frame);
 
 /* ---------- the adjust panel ---------- */
 const panel = document.getElementById("panel");
-const fields = { sep: v => v.toFixed(1) + "mm", vy: v => (v > 0 ? "+" : "") + v.toFixed(1) + "mm", k: v => "×" + v.toFixed(2), dist: v => v.toFixed(1) };
-function showVals() { for (const id in fields) { document.getElementById(id).value = S[id]; document.getElementById(id + "v").textContent = fields[id](S[id]); } }
+const fields = { sep: v => v.toFixed(1) + "mm", vy: v => (v > 0 ? "+" : "") + v.toFixed(1) + "mm", k: v => "×" + v.toFixed(2), dist: v => v.toFixed(1), zoom: v => "×" + v.toFixed(2) };
+function showVals() {
+  for (const id in fields) { document.getElementById(id).value = S[id]; document.getElementById(id + "v").textContent = fields[id](S[id]); }
+  for (const b of document.querySelectorAll("#modes div")) b.classList.toggle("on", b.dataset.m === S.mode);
+  document.getElementById("camrow").classList.toggle("on", S.mode !== "scene");
+}
+for (const b of document.querySelectorAll("#modes div")) b.addEventListener("click", async () => {
+  S.mode = b.dataset.m; save(); showVals();
+  document.getElementById("note").textContent = "";
+  if (S.mode === "scene") stopCam(); else await startCam();
+});
 for (const id in fields) document.getElementById(id).addEventListener("input", e => { S[id] = parseFloat(e.target.value); showVals(); build(); save(); });
 document.getElementById("reset").addEventListener("click", () => { S = Object.assign({}, DEFAULTS); showVals(); build(); save(); });
 showVals();
@@ -280,6 +347,7 @@ document.getElementById("go").addEventListener("click", async () => {
     } catch (e) {}
     addEventListener("deviceorientation", onOrient);
     keepAwake();
+    if (S.mode !== "scene" && !(await startCam())) return;
     started = true;
     document.getElementById("go").textContent = "つづける";
     setTimeout(doRecenter, 400);
