@@ -27,6 +27,20 @@
   <div class="list" id="list"></div>
 </main>
 <script>
+/* Home-screen apps keep an old copy; load the newest one when its VERSION differs. Bump VERSION on every change. */
+const VERSION = "2026-11-25.2";
+async function checkUpdate() {
+  try {
+    const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
+    const m = t.match(/const VERSION = "([^"]+)"/);
+    if (!m || m[1] === VERSION || sessionStorage.getItem("reloaded-" + m[1])) return;
+    sessionStorage.setItem("reloaded-" + m[1], "1");
+    location.replace(location.pathname + "?v=" + encodeURIComponent(m[1]));
+  } catch (e) {}
+}
+checkUpdate();
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") checkUpdate(); });
+
 /* Add a page: put its folder next to this file (e.g. vr/index.html) and one line here.
    soon: true shows it greyed out without a link. */
 const ITEMS = [

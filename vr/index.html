@@ -43,7 +43,27 @@
   <div class="row"><span>見える広さ</span><input id="dist" type="range" min="30" max="50" step="0.5"><span id="distv"></span></div>
   <div class="btns"><div id="reset">元に戻す</div><div id="go">はじめる</div></div>
   <div class="s" id="note"></div>
+  <div class="s" id="ver" style="text-align:right;margin:0"></div>
 </div>
+<script>
+/* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
+   often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
+   loads that one. Bump VERSION on every change. */
+const VERSION = "2026-11-25.4";
+async function checkUpdate() {
+  try {
+    const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
+    const m = t.match(/const VERSION = "([^"]+)"/);
+    if (!m || m[1] === VERSION) return;
+    const key = "reloaded-" + m[1];
+    if (sessionStorage.getItem(key)) return;      // already tried once: don't loop
+    sessionStorage.setItem(key, "1");
+    location.replace(location.pathname + "?v=" + encodeURIComponent(m[1]));
+  } catch (e) {}
+}
+checkUpdate();
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && !window.started) checkUpdate(); });
+</script>
 <script>
 "use strict";
 /* ---------- settings (tunable) ---------- */
@@ -334,7 +354,9 @@ for (const id in fields) document.getElementById(id).addEventListener("input", e
 document.getElementById("reset").addEventListener("click", () => { S = Object.assign({}, DEFAULTS); showVals(); build(); save(); });
 showVals();
 
-let wake = null, started = false;
+let wake = null;
+window.started = false;
+document.getElementById("ver").textContent = "版 " + VERSION;
 async function keepAwake() { try { if (navigator.wakeLock) wake = await navigator.wakeLock.request("screen"); } catch (e) {} }
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && wake) keepAwake(); });
 document.getElementById("go").addEventListener("click", async () => {
