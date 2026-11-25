@@ -9,7 +9,7 @@
 <title>VR</title>
 <style>
   html, body { margin:0; height:100%; background:#000; overflow:hidden; touch-action:none; -webkit-user-select:none; user-select:none; }
-  canvas { position:fixed; inset:0; width:100vw; height:100vh; height:100dvh; image-rendering:pixelated; image-rendering:crisp-edges; }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; height:100dvh; }
   #panel { position:fixed; left:50%; bottom:0; transform:translateX(-50%); width:min(560px, 100vw); max-height:100dvh; overflow:auto; background:rgba(14,15,18,.9); color:#e8e6e1; font-family:system-ui, -apple-system, "Hiragino Sans", sans-serif; padding:12px 16px 14px; border-radius:16px 16px 0 0; box-sizing:border-box; }
   #panel.off { display:none; }
   #panel b { font-size:17px; }
@@ -49,7 +49,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-25.4";
+const VERSION = "2026-11-25.5";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -67,17 +67,18 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
 <script>
 "use strict";
 /* ---------- settings (tunable) ---------- */
-const EYE_H = 200;          // canvas height in pixels (lower = chunkier pixels, faster)
+const RENDER_SCALE = 2;     // canvas pixels per CSS pixel (iPhone screens are 3; 2 is sharp and keeps the GPU cool)
 const PX_PER_MM = 6.04;     // CSS pixels per millimetre on the phone screen (recent iPhones: 460 ppi / 3)
 const IPD = 0.064;          // distance between the eyes in the scene, metres (depth of the snow)
 const EYE_HEIGHT = 1.6;     // how high the eyes are above the snow
 const SNOW_N = 450;         // snowflakes
+const FLAKE = 0.05;         // snowflake size, metres
 const K1 = 0.34, K2 = 0.55; // lens distortion (Cardboard's usual values), scaled by the "ゆがみ補正" slider
 const MAX_TAN = 1.25;       // beyond this angle from the lens centre, draw black
-// the viewer: lens spacing (mm), lens centre up/down from the screen middle (mm), distortion scale, screen-to-lens distance (mm)
-// zoom: camera picture size (1 = true size, as the iPhone's 1x camera sees it); mode: scene | cam | camsnow
-const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39, zoom: 1, mode: "scene" };
 const CAM_TAN_H = Math.tan(34 * Math.PI / 180);   // half of the 1x camera's horizontal view (about 68 deg across)
+// sep: lens spacing (mm), vy: lens centre up/down (mm), k: distortion scale, dist: screen-to-lens (mm),
+// zoom: camera picture size (1 = true size), mode: scene | cam | camsnow
+const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39, zoom: 1, mode: "scene" };
 let S = Object.assign({}, DEFAULTS);
 try { Object.assign(S, JSON.parse(localStorage.getItem("vrcfg") || "{}")); } catch (e) {}
 function save() { try { localStorage.setItem("vrcfg", JSON.stringify(S)); } catch (e) {} }
@@ -95,11 +96,6 @@ function qRot(q, x, y, z) {
   const [qx, qy, qz, qw] = q;
   const ix = qw*x + qy*z - qz*y, iy = qw*y + qz*x - qx*z, iz = qw*z + qx*y - qy*x, iw = -qx*x - qy*y - qz*z;
   return [ix*qw + iw*-qx + iy*-qz - iz*-qy, iy*qw + iw*-qy + iz*-qx - ix*-qz, iz*qw + iw*-qz + ix*-qy - iy*-qx];
-}
-function hash3(x, y, z) {
-  let h = (x * 374761393 + y * 668265263 + z * 2147483647) | 0;
-  h = Math.imul(h ^ (h >>> 13), 1274126177);
-  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
 }
 
 /* ---------- head orientation ---------- */
@@ -127,136 +123,214 @@ function doRecenter() {
   recenter = qAxis(0, 1, 0, -Math.atan2(-f[0], -f[2]));
 }
 
-/* ---------- the scene: night sky, mountains, a river in the snow ---------- */
-const MOON = (() => { const v = [0.45, 0.42, -0.79], l = Math.hypot(...v); return v.map(a => a / l); })();
-const MOON_COS = Math.cos(2.4 * PI / 180), GLOW_COS = Math.cos(9 * PI / 180);
-const DEG = PI / 180;
-function farH(az) { return (6.5 + 3 * Math.sin(3*az + 1) + 2 * Math.sin(7*az + 2) + 0.8 * Math.sin(17*az)) * DEG; }
-function nearH(az) { return (2.8 + 2.2 * Math.sin(5*az + 4) + 1.3 * Math.sin(11*az + 1) + 0.5 * Math.sin(29*az)) * DEG; }
+/* ---------- GPU drawing ----------
+   Every screen pixel is measured (in mm) from its lens centre. The lens bends it outward
+   (r_screen = r * (1 + k1 r^2 + k2 r^4)), so the shader undoes that to find the true angle and draws
+   what lies there: the night scene, or the camera picture. Through the lens it looks straight again. */
+const cv = document.getElementById("c");
+const gl = cv.getContext("webgl2", { antialias: false, alpha: false, preserveDrawingBuffer: false });
+if (!gl) document.getElementById("note").textContent = "この端末では描けませんでした（WebGL2 が使えません）。";
 
-let T = 0;
-function sky(dx, dy, dz, out) {
-  const el = Math.asin(Math.max(-1, Math.min(1, dy)));
-  const az = Math.atan2(dx, -dz);
-  const hn = nearH(az);
-  if (el < hn) {
-    if (el < 0) { out[0] = 20; out[1] = 26; out[2] = 48; return; }
-    out[0] = 13; out[1] = 17; out[2] = 30; return;
+const VS_FULL = `#version 300 es
+in vec2 aP; void main() { gl_Position = vec4(aP, 0.0, 1.0); }`;
+
+const FS_MAIN = `#version 300 es
+precision highp float;
+uniform vec2 uRes, uMm, uCamTan;
+uniform float uSep, uVy, uDist, uK1, uK2, uMaxTan, uOff, uT, uEyeH, uCamOk;
+uniform vec3 uR, uU, uF;
+uniform int uMode;
+uniform sampler2D uCam;
+out vec4 o;
+const float PI = 3.14159265, DEG = PI / 180.0;
+
+float h3(vec3 p) {
+  uvec3 v = uvec3(ivec3(floor(p)) + 1000000);
+  uint h = v.x * 374761393u + v.y * 668265263u + v.z * 2246822519u;
+  h = (h ^ (h >> 13u)) * 1274126177u;
+  h ^= h >> 16u;
+  return float(h) / 4294967296.0;
+}
+float farH(float a) { return (6.5 + 3.0*sin(3.0*a + 1.0) + 2.0*sin(7.0*a + 2.0) + 0.8*sin(17.0*a)) * DEG; }
+float nearH(float a) { return (2.8 + 2.2*sin(5.0*a + 4.0) + 1.3*sin(11.0*a + 1.0) + 0.5*sin(29.0*a)) * DEG; }
+
+vec3 sky(vec3 d) {
+  float el = asin(clamp(d.y, -1.0, 1.0));
+  float az = atan(d.x, -d.z);
+  float hn = nearH(az);
+  if (el < hn) return el < 0.0 ? vec3(20, 26, 48) : vec3(13, 17, 30);
+  float hf = farH(az);
+  if (el < hf) return (hf > 9.0*DEG && el > hf - 1.3*DEG) ? vec3(120, 132, 165) : vec3(26, 32, 56);
+  float k = clamp(el / (PI * 0.5), 0.0, 1.0);
+  vec3 c = vec3(24.0 - 18.0*k, 32.0 - 24.0*k, 64.0 - 40.0*k);
+  vec3 moon = normalize(vec3(0.45, 0.42, -0.79));
+  float m = dot(d, moon);
+  float mc = cos(2.4*DEG), gc = cos(9.0*DEG);
+  if (m > mc) {
+    // a little shading on the moon so it is not a flat disc
+    float e = (m - mc) / (1.0 - mc);
+    return mix(vec3(214, 206, 170), vec3(240, 234, 204), smoothstep(0.0, 0.5, e));
   }
-  const hf = farH(az);
-  if (el < hf) {
-    if (hf > 9 * DEG && el > hf - 1.3 * DEG) { out[0] = 120; out[1] = 132; out[2] = 165; return; }
-    out[0] = 26; out[1] = 32; out[2] = 56; return;
+  if (m > gc) { float g = (m - gc) / (mc - gc); c += vec3(40, 40, 46) * g * g; }
+  // stars: a fine grid on the sphere, a few cells lit, each twinkling at its own pace, drawn as soft dots
+  float N = 420.0;
+  vec3 q = (d + 1.0) * N, cell = floor(q);
+  float h = h3(cell);
+  if (h < 0.0045 + 0.004 * k) {
+    vec3 f = q - cell - 0.5;
+    float dot_ = 1.0 - smoothstep(0.15, 0.5, length(f));
+    float br = 0.55 + 0.45 * sin(uT * (1.0 + h * 400.0) + h3(cell.zxy) * 6.283);
+    float s = (150.0 + 105.0 * h3(cell.yzx)) * br * dot_;
+    c = max(c, vec3(s, s, s * 1.05));
   }
-  const k = Math.min(1, Math.max(0, el / (PI / 2)));
-  let r = 24 - 18 * k, g = 32 - 24 * k, b = 64 - 40 * k;
-  const m = dx * MOON[0] + dy * MOON[1] + dz * MOON[2];
-  if (m > MOON_COS) { out[0] = 236; out[1] = 230; out[2] = 196; return; }
-  if (m > GLOW_COS) { const gl = (m - GLOW_COS) / (MOON_COS - GLOW_COS); r += 40 * gl * gl; g += 40 * gl * gl; b += 46 * gl * gl; }
-  const N = 150, ix = Math.floor((dx + 1) * N), iy = Math.floor((dy + 1) * N), iz = Math.floor((dz + 1) * N);
-  const h = hash3(ix, iy, iz);
-  if (h < 0.012 + 0.01 * k) {
-    const ph = hash3(iz, ix, iy) * 6.283, br = 0.55 + 0.45 * Math.sin(T * (1 + h * 160) + ph);
-    const s = (140 + 115 * hash3(iy, iz, ix)) * br;
-    r = Math.max(r, s); g = Math.max(g, s); b = Math.max(b, s * 1.05);
-  }
-  out[0] = r; out[1] = g; out[2] = b;
+  return c;
 }
 
-function riverZ(x) { return -9 + 2.2 * Math.sin(x * 0.045 + 0.6) + 0.8 * Math.sin(x * 0.13); }
-const RIVER_HALF = 2.6;
-const tmp = [0, 0, 0];
-function shade(ex, ey, ez, dx, dy, dz, out) {
-  if (dy >= -0.002) { sky(dx, dy, dz, out); return; }
-  const t = (ey + EYE_HEIGHT) / -dy;
-  const px = ex + dx * t, pz = ez + dz * t;
-  const fog = 1 - Math.exp(-t / 70);
-  const zc = riverZ(px), dist = Math.abs(pz - zc);
-  let r, g, b;
-  if (dist < RIVER_HALF) {
-    const wob = 0.018 * Math.sin(px * 1.7 + T * 1.6) + 0.012 * Math.sin(pz * 2.3 - T * 1.1);
-    sky(dx + wob, -dy, dz, tmp);
-    r = tmp[0] * 0.55 + 4; g = tmp[1] * 0.6 + 8; b = tmp[2] * 0.7 + 16;
-    const gl = hash3(Math.floor(px * 3 - T * 4), Math.floor(pz * 6), 7);
-    if (gl > 0.985) { r += 40; g += 46; b += 60; }
-  } else if (dist < RIVER_HALF + 0.35) {
-    r = 30; g = 34; b = 44;
+float riverZ(float x) { return -9.0 + 2.2*sin(x*0.045 + 0.6) + 0.8*sin(x*0.13); }
+
+vec3 shade(vec3 e, vec3 d) {
+  if (d.y >= -0.002) return sky(d);
+  float t = min((e.y + uEyeH) / -d.y, 4000.0);
+  float px = e.x + d.x * t, pz = e.z + d.z * t;
+  float fog = 1.0 - exp(-t / 70.0);
+  float dist = abs(pz - riverZ(px));
+  vec3 c;
+  const float RH = 2.6;
+  if (dist < RH) {
+    float wob = 0.018*sin(px*1.7 + uT*1.6) + 0.012*sin(pz*2.3 - uT*1.1);
+    vec3 s = sky(normalize(vec3(d.x + wob, -d.y, d.z)));
+    c = s * vec3(0.55, 0.6, 0.7) + vec3(4, 8, 16);
+    if (h3(vec3(floor(px*3.0 - uT*4.0), floor(pz*6.0), 7.0)) > 0.985) c += vec3(40, 46, 60);
+  } else if (dist < RH + 0.35) {
+    c = vec3(30, 34, 44);
   } else {
-    const n = (hash3(Math.floor(px * 2), Math.floor(pz * 2), 3) - 0.5) * 14;
-    r = 118 + n; g = 128 + n; b = 158 + n;
+    float n = (h3(vec3(floor(px*5.0), floor(pz*5.0), 3.0)) - 0.5) * 8.0;
+    c = vec3(118, 128, 158) + n;
   }
-  out[0] = r + (20 - r) * fog; out[1] = g + (26 - g) * fog; out[2] = b + (48 - b) * fog;
+  return mix(c, vec3(20, 26, 48), fog);
 }
+
+void main() {
+  vec2 fc = gl_FragCoord.xy;
+  float xm = fc.x / uRes.x * uMm.x, ym = (uRes.y - fc.y) / uRes.y * uMm.y;
+  float side = xm < uMm.x * 0.5 ? -1.0 : 1.0;
+  float lx = uMm.x * 0.5 + side * uSep * 0.5, ly = uMm.y * 0.5 - uVy;
+  vec2 ts = vec2(xm - lx, ly - ym) / uDist;
+  float rs = length(ts), r = rs;
+  for (int i = 0; i < 8; i++) {
+    float r2 = r * r;
+    r -= (r * (1.0 + uK1*r2 + uK2*r2*r2) - rs) / (1.0 + 3.0*uK1*r2 + 5.0*uK2*r2*r2);
+  }
+  if (r > uMaxTan || !(r >= 0.0)) { o = vec4(0, 0, 0, 1); return; }
+  vec2 tu = rs > 0.0 ? ts * (r / rs) : ts;
+  if (uMode == 1) {
+    vec2 uv = vec2(0.5 + tu.x / (2.0 * uCamTan.x), 0.5 - tu.y / (2.0 * uCamTan.y));
+    if (uCamOk < 0.5 || uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { o = vec4(0, 0, 0, 1); return; }
+    o = vec4(texture(uCam, uv).rgb, 1.0);
+    return;
+  }
+  vec3 dir = normalize(uF + uR * tu.x + uU * tu.y);
+  vec3 c = shade(uR * side * uOff, dir);
+  o = vec4(min(c, 255.0) / 255.0, 1.0);
+}`;
+
+// snowflakes: each one is projected for each eye and pushed outward the way the lens pulls it in
+const VS_SNOW = `#version 300 es
+in vec3 aP;
+uniform vec2 uMm;
+uniform float uSep, uVy, uDist, uK1, uK2, uOff, uSide, uPxMm, uFlake, uMaxTan;
+uniform vec3 uR, uU, uF;
+out float vA;
+void main() {
+  gl_Position = vec4(2.0, 2.0, 0.0, 1.0); gl_PointSize = 0.0; vA = 0.0;
+  vec3 rel = aP - uR * uSide * uOff;
+  float cz = dot(rel, uF);
+  if (cz < 0.3) return;
+  vec2 t = vec2(dot(rel, uR), dot(rel, uU)) / cz;
+  float r2 = dot(t, t);
+  if (r2 > uMaxTan * uMaxTan) return;
+  float f = 1.0 + uK1*r2 + uK2*r2*r2;
+  float lx = uMm.x * 0.5 + uSide * uSep * 0.5, ly = uMm.y * 0.5 - uVy;
+  float xm = lx + t.x * f * uDist, ym = ly - t.y * f * uDist;
+  if ((uSide < 0.0 && xm > uMm.x * 0.5) || (uSide > 0.0 && xm < uMm.x * 0.5)) return;
+  gl_Position = vec4(xm / uMm.x * 2.0 - 1.0, 1.0 - ym / uMm.y * 2.0, 0.0, 1.0);
+  float px = uFlake / cz * f * uDist * uPxMm;
+  gl_PointSize = clamp(px, 2.5, 32.0);
+  vA = clamp(px / 2.5, 0.45, 0.9);
+}`;
+const FS_SNOW = `#version 300 es
+precision mediump float;
+in float vA; out vec4 o;
+void main() { float a = 1.0 - smoothstep(0.2, 0.5, length(gl_PointCoord - 0.5)); o = vec4(0.96, 0.94, 0.91, a * vA); }`;
+
+function prog(vs, fs) {
+  const p = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    gl.attachShader(p, s);
+  }
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name; u[nm] = gl.getUniformLocation(p, nm); }
+  return { p, u };
+}
+const P = prog(VS_FULL, FS_MAIN), PS = prog(VS_SNOW, FS_SNOW);
+const vaoFull = gl.createVertexArray(); gl.bindVertexArray(vaoFull);
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.bindAttribLocation(P.p, 0, "aP");
+
+const snowPos = new Float32Array(SNOW_N * 3);
+const vaoSnow = gl.createVertexArray(); gl.bindVertexArray(vaoSnow);
+const snowBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, snowBuf);
+gl.bufferData(gl.ARRAY_BUFFER, snowPos.byteLength, gl.DYNAMIC_DRAW);
+const snowLoc = gl.getAttribLocation(PS.p, "aP");
+gl.enableVertexAttribArray(snowLoc); gl.vertexAttribPointer(snowLoc, 3, gl.FLOAT, false, 0, 0);
+gl.bindVertexArray(null);
+
+const camTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, camTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+
+let mmW = 0, mmH = 0;
+function resize() {
+  const sc = Math.min(RENDER_SCALE, devicePixelRatio || 1);
+  cv.width = Math.round(innerWidth * sc); cv.height = Math.round(innerHeight * sc);
+  mmW = innerWidth / PX_PER_MM; mmH = innerHeight / PX_PER_MM;
+  gl.viewport(0, 0, cv.width, cv.height);
+}
+addEventListener("resize", resize);
+resize();
 
 /* ---------- snow ---------- */
 const flakes = [];
 function rnd(a, b) { return a + Math.random() * (b - a); }
 for (let i = 0; i < SNOW_N; i++) flakes.push({ x: rnd(-14, 14), y: rnd(-EYE_HEIGHT, 9), z: rnd(-14, 14), v: rnd(0.5, 1.1), p: rnd(0, 6.28) });
+let T = 0;
 function stepSnow(dt) {
-  for (const f of flakes) {
+  flakes.forEach((f, i) => {
     f.y -= f.v * dt;
     f.x += Math.sin(T * 0.7 + f.p) * 0.25 * dt;
     if (f.y < -EYE_HEIGHT) { f.y = 9; f.x = rnd(-14, 14); f.z = rnd(-14, 14); }
-  }
+    snowPos[i * 3] = f.x; snowPos[i * 3 + 1] = f.y; snowPos[i * 3 + 2] = f.z;
+  });
 }
 
-/* ---------- the lenses: which way each screen pixel looks ----------
-   Each pixel's place on the screen (in mm) is measured from its lens centre. The lens bends it outward
-   (r_screen = r * (1 + k1 r^2 + k2 r^4)), so we undo that to find the true angle and draw what lies there.
-   Through the lens the picture then looks straight again and the right size. */
-const cv = document.getElementById("c");
-const ctx = cv.getContext("2d");
-let W = 0, H = 0, img = null, px32 = null, lutU = null, lutV = null, lutS = null;
-let mmW = 0, mmH = 0, lensX = [0, 0], lensY = 0, k1 = K1, k2 = K2;
-function undistort(rs) {           // screen tan-radius -> true tan-radius (Newton)
-  let r = rs;
-  for (let n = 0; n < 8; n++) {
-    const r2 = r * r, f = r * (1 + k1 * r2 + k2 * r2 * r2) - rs, d = 1 + 3 * k1 * r2 + 5 * k2 * r2 * r2;
-    r -= f / d;
-  }
-  return r;
-}
-function build() {
-  H = EYE_H; W = Math.max(80, Math.round(H * innerWidth / innerHeight));
-  cv.width = W; cv.height = H;
-  img = ctx.createImageData(W, H);
-  px32 = new Uint32Array(img.data.buffer);
-  lutU = new Float32Array(W * H); lutV = new Float32Array(W * H); lutS = new Int8Array(W * H);
-  mmW = innerWidth / PX_PER_MM; mmH = innerHeight / PX_PER_MM;
-  lensX = [mmW / 2 - S.sep / 2, mmW / 2 + S.sep / 2]; lensY = mmH / 2 - S.vy;
-  k1 = K1 * S.k; k2 = K2 * S.k;
-  for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
-    const k = j * W + i;
-    const xm = (i + 0.5) / W * mmW, ym = (j + 0.5) / H * mmH;
-    const side = xm < mmW / 2 ? 0 : 1;
-    const tx = (xm - lensX[side]) / S.dist, ty = (lensY - ym) / S.dist;
-    const rs = Math.hypot(tx, ty);
-    const ru = rs > 0 ? undistort(rs) : 0;
-    if (ru > MAX_TAN || !(ru >= 0)) { lutS[k] = 0; continue; }
-    const s = rs > 0 ? ru / rs : 1;
-    lutU[k] = tx * s; lutV[k] = ty * s; lutS[k] = side === 0 ? -1 : 1;
-  }
-}
-// true tan-angles (tx, ty) for one eye -> canvas pixel, or -1
-function toPixel(side, tx, ty) {
-  const r2 = tx * tx + ty * ty, f = 1 + k1 * r2 + k2 * r2 * r2;
-  const xm = lensX[side < 0 ? 0 : 1] + tx * f * S.dist, ym = lensY - ty * f * S.dist;
-  const i = Math.floor(xm / mmW * W), j = Math.floor(ym / mmH * H);
-  if (i < 0 || i >= W || j < 0 || j >= H) return -1;
-  const k = j * W + i;
-  return lutS[k] === side ? k : -1;
-}
-addEventListener("resize", build);
-build();
-
-/* ---------- the camera: one picture, shown to both eyes through the same lens correction ---------- */
+/* ---------- the camera ---------- */
 const vid = document.getElementById("vid");
-const camCv = document.createElement("canvas"), camCtx = camCv.getContext("2d", { willReadFrequently: true });
-let camOn = false, camLut = null, camKey = "", camW = 0, camH = 0;
+let camOn = false;
 async function startCam() {
   if (camOn) return true;
   try {
-    const st = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 480 } }, audio: false });
+    const st = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
     vid.srcObject = st; await vid.play(); camOn = true; return true;
   } catch (e) {
     document.getElementById("note").textContent = "カメラが使えませんでした（" + (e.name || e) + "）。設定 → Safari → カメラ を「許可」にしてください。";
@@ -268,71 +342,50 @@ function stopCam() {
   for (const t of vid.srcObject.getTracks()) t.stop();
   vid.srcObject = null; camOn = false;
 }
-// which camera pixel each screen pixel shows (-1 = outside the picture)
-function camTable() {
-  const vw = vid.videoWidth, vh = vid.videoHeight;
-  if (!vw || !vh) return false;
-  const sc = Math.min(1, 320 / vw);            // read a small copy: chunky pixels, and fast
-  camW = Math.round(vw * sc); camH = Math.round(vh * sc);
-  const key = camW + "x" + camH + "|" + W + "x" + H + "|" + S.zoom + "|" + S.sep + "|" + S.vy + "|" + S.k + "|" + S.dist;
-  if (key === camKey) return true;
-  camKey = key; camCv.width = camW; camCv.height = camH;
-  const th = CAM_TAN_H / S.zoom, tv = th * vh / vw;
-  camLut = new Int32Array(W * H);
-  for (let k = 0; k < W * H; k++) {
-    if (lutS[k] === 0) { camLut[k] = -1; continue; }
-    const x = 0.5 + lutU[k] / (2 * th), y = 0.5 - lutV[k] / (2 * tv);
-    camLut[k] = x < 0 || x >= 1 || y < 0 || y >= 1 ? -1 : Math.floor(y * camH) * camW + Math.floor(x * camW);
-  }
-  return true;
-}
-function renderCam() {
-  if (!camOn || vid.readyState < 2 || !camTable()) { px32.fill(0xff000000); return; }
-  camCtx.drawImage(vid, 0, 0, camW, camH);
-  const src = new Uint32Array(camCtx.getImageData(0, 0, camW, camH).data.buffer);
-  const n = W * H;
-  for (let k = 0; k < n; k++) { const c = camLut[k]; px32[k] = c < 0 ? 0xff000000 : src[c]; }
-}
 
-const col = [0, 0, 0];
-function render(q) {
-  const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
-  const o = IPD / 2;
-  const eL = [-R[0] * o, -R[1] * o, -R[2] * o], eR = [R[0] * o, R[1] * o, R[2] * o];
-  const n = W * H;
-  if (S.mode !== "scene") renderCam();
-  for (let k = 0; k < n && S.mode === "scene"; k++) {
-    const s = lutS[k];
-    if (s === 0) { px32[k] = 0xff000000; continue; }
-    const u = lutU[k], v = lutV[k], e = s < 0 ? eL : eR;
-    let dx = F[0] + R[0] * u + U[0] * v, dy = F[1] + R[1] * u + U[1] * v, dz = F[2] + R[2] * u + U[2] * v;
-    const l = 1 / Math.sqrt(dx*dx + dy*dy + dz*dz); dx *= l; dy *= l; dz *= l;
-    shade(e[0], e[1], e[2], dx, dy, dz, col);
-    px32[k] = 0xff000000 | (Math.min(255, col[2]) << 16) | (Math.min(255, col[1]) << 8) | Math.min(255, col[0]);
-  }
-  // snowflakes for each eye (near ones bigger, shifted between the eyes = depth)
-  if (S.mode === "cam") return;
-  for (const side of [-1, 1]) {
-    const e = side < 0 ? eL : eR;
-    for (const f of flakes) {
-      const rx = f.x - e[0], ry = f.y - e[1], rz = f.z - e[2];
-      const cz = rx * F[0] + ry * F[1] + rz * F[2];
-      if (cz < 0.3) continue;
-      const cx = rx * R[0] + ry * R[1] + rz * R[2], cy = rx * U[0] + ry * U[1] + rz * U[2];
-      const k = toPixel(side, cx / cz, cy / cz);
-      if (k < 0) continue;
-      px32[k] = 0xfff4eee8;
-      if (cz < 2.5) { if (k + 1 < n && lutS[k + 1] === side) px32[k + 1] = 0xfff4eee8; if (k + W < n && lutS[k + W] === side) px32[k + W] = 0xfff4eee8; }
-    }
-  }
+/* ---------- each frame ---------- */
+function setLens(u) {
+  gl.uniform2f(u.uMm, mmW, mmH);
+  gl.uniform1f(u.uSep, S.sep); gl.uniform1f(u.uVy, S.vy); gl.uniform1f(u.uDist, S.dist);
+  gl.uniform1f(u.uK1, K1 * S.k); gl.uniform1f(u.uK2, K2 * S.k);
+  gl.uniform1f(u.uMaxTan, MAX_TAN); gl.uniform1f(u.uOff, IPD / 2);
 }
-
 let last = performance.now();
 function frame(now) {
   const dt = Math.min(0.1, (now - last) / 1000); last = now; T += dt;
-  stepSnow(dt);
-  render(headQ());
-  ctx.putImageData(img, 0, 0);
+  const q = headQ();
+  const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
+  const cam = S.mode !== "scene";
+  let camOk = 0;
+  if (cam && camOn && vid.readyState >= 2 && vid.videoWidth) {
+    gl.bindTexture(gl.TEXTURE_2D, camTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, vid);
+    camOk = 1;
+  }
+  gl.disable(gl.BLEND);
+  gl.useProgram(P.p); const u = P.u;
+  setLens(u);
+  gl.uniform2f(u.uRes, cv.width, cv.height);
+  gl.uniform3f(u.uR, ...R); gl.uniform3f(u.uU, ...U); gl.uniform3f(u.uF, ...F);
+  gl.uniform1f(u.uT, T); gl.uniform1f(u.uEyeH, EYE_HEIGHT);
+  gl.uniform1i(u.uMode, cam ? 1 : 0); gl.uniform1f(u.uCamOk, camOk);
+  const th = CAM_TAN_H / S.zoom, tv = th * (vid.videoHeight || 3) / (vid.videoWidth || 4);
+  gl.uniform2f(u.uCamTan, th, tv);
+  gl.uniform1i(u.uCam, 0); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, camTex);
+  gl.bindVertexArray(vaoFull); gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  if (S.mode !== "cam") {
+    stepSnow(dt);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(PS.p); const v = PS.u;
+    setLens(v);
+    gl.uniform3f(v.uR, ...R); gl.uniform3f(v.uU, ...U); gl.uniform3f(v.uF, ...F);
+    gl.uniform1f(v.uPxMm, cv.width / mmW); gl.uniform1f(v.uFlake, FLAKE);
+    gl.bindVertexArray(vaoSnow);
+    gl.bindBuffer(gl.ARRAY_BUFFER, snowBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, snowPos);
+    for (const side of [-1, 1]) { gl.uniform1f(v.uSide, side); gl.drawArrays(gl.POINTS, 0, SNOW_N); }
+  }
+  gl.bindVertexArray(null);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
@@ -345,13 +398,13 @@ function showVals() {
   for (const b of document.querySelectorAll("#modes div")) b.classList.toggle("on", b.dataset.m === S.mode);
   document.getElementById("camrow").classList.toggle("on", S.mode !== "scene");
 }
+for (const id in fields) document.getElementById(id).addEventListener("input", e => { S[id] = parseFloat(e.target.value); showVals(); save(); });
 for (const b of document.querySelectorAll("#modes div")) b.addEventListener("click", async () => {
   S.mode = b.dataset.m; save(); showVals();
   document.getElementById("note").textContent = "";
   if (S.mode === "scene") stopCam(); else await startCam();
 });
-for (const id in fields) document.getElementById(id).addEventListener("input", e => { S[id] = parseFloat(e.target.value); showVals(); build(); save(); });
-document.getElementById("reset").addEventListener("click", () => { S = Object.assign({}, DEFAULTS); showVals(); build(); save(); });
+document.getElementById("reset").addEventListener("click", () => { const m = S.mode; S = Object.assign({}, DEFAULTS, { mode: m }); showVals(); save(); });
 showVals();
 
 let wake = null;
@@ -360,7 +413,7 @@ document.getElementById("ver").textContent = "版 " + VERSION;
 async function keepAwake() { try { if (navigator.wakeLock) wake = await navigator.wakeLock.request("screen"); } catch (e) {} }
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && wake) keepAwake(); });
 document.getElementById("go").addEventListener("click", async () => {
-  if (!started) {
+  if (!window.started) {
     try {
       if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
         const r = await DeviceOrientationEvent.requestPermission();
@@ -370,7 +423,7 @@ document.getElementById("go").addEventListener("click", async () => {
     addEventListener("deviceorientation", onOrient);
     keepAwake();
     if (S.mode !== "scene" && !(await startCam())) return;
-    started = true;
+    window.started = true;
     document.getElementById("go").textContent = "つづける";
     setTimeout(doRecenter, 400);
   }
@@ -389,7 +442,7 @@ addEventListener("pointermove", e => {
 });
 cv.addEventListener("pointerup", () => {
   const moved = drag && drag.moved; drag = null;
-  if (moved || !started) return;
+  if (moved || !window.started) return;
   const n = performance.now();
   if (n - lastTap < 350) { clearTimeout(tapTimer); lastTap = 0; doRecenter(); return; }
   lastTap = n;
