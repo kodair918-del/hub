@@ -10,13 +10,16 @@
 <style>
   html, body { margin:0; height:100%; background:#000; overflow:hidden; touch-action:none; -webkit-user-select:none; user-select:none; }
   canvas { position:fixed; inset:0; width:100vw; height:100vh; height:100dvh; }
-  #panel { position:fixed; left:50%; bottom:0; transform:translateX(-50%); width:min(560px, 100vw); max-height:100dvh; overflow:auto; background:rgba(14,15,18,.9); color:#e8e6e1; font-family:system-ui, -apple-system, "Hiragino Sans", sans-serif; padding:12px 16px 14px; border-radius:16px 16px 0 0; box-sizing:border-box; }
+  #panel { z-index:4; position:fixed; left:50%; bottom:0; transform:translateX(-50%); width:min(720px, 100vw); max-height:100dvh; overflow:auto; background:rgba(14,15,18,.82); color:#e8e6e1; font-family:system-ui, -apple-system, "Hiragino Sans", sans-serif; padding:12px 16px 14px; border-radius:16px 16px 0 0; box-sizing:border-box; }
   #panel.off { display:none; }
   #panel b { font-size:17px; }
   #panel .s { font-size:12px; color:#9aa0ab; line-height:1.6; margin:4px 0 8px; }
-  .row { display:grid; grid-template-columns:7.5em 1fr 3.6em; align-items:center; gap:8px; font-size:13px; margin:4px 0; }
-  .row input { width:100%; }
-  .row span:last-child { text-align:right; color:#9aa0ab; font-variant-numeric:tabular-nums; }
+  #ctl { display:grid; grid-template-columns:repeat(auto-fit, minmax(250px, 1fr)); gap:6px 14px; }
+  .row { display:grid; grid-template-columns:1fr 48px 5.2em 48px; align-items:center; gap:6px; font-size:13px; }
+  .row .pm { height:44px; border-radius:12px; background:#2c303b; display:flex; align-items:center; justify-content:center; font-size:24px; font-weight:bold; touch-action:manipulation; }
+  .row .pm:active { background:#7fb4ff; color:#0b0b0a; }
+  .row .val { text-align:center; font-variant-numeric:tabular-nums; font-size:15px; }
+  #guide { position:fixed; inset:0; width:100vw; height:100vh; height:100dvh; pointer-events:none; z-index:5; }
   .btns { display:flex; gap:8px; margin-top:10px; }
   .btns div { flex:1; text-align:center; padding:11px 0; border-radius:12px; font-weight:bold; font-size:15px; }
   #go { background:#7fb4ff; color:#0b0b0a; }
@@ -31,16 +34,13 @@
 </head>
 <body>
 <canvas id="c"></canvas>
+<canvas id="guide"></canvas>
 <video id="vid" playsinline muted autoplay></video>
 <div id="panel">
   <b>夜の川辺</b>
-  <div class="s">横向きにしてゴーグルに入れると、首の動きで見回せます。左右の丸がそれぞれのレンズの真ん中に来るように合わせてください。<br>ゴーグルの中で：画面を1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
+  <div class="s">黄色い十字が、それぞれのレンズの真ん中に来るように合わせてください（押し続けると連続で動きます）。<br>ゴーグルの中で：画面を1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
   <div class="modes" id="modes"><div data-m="scene">夜の川辺</div><div data-m="cam">カメラ</div><div data-m="camsnow">カメラ＋雪</div></div>
-  <div class="row" id="camrow"><span>カメラの大きさ</span><input id="zoom" type="range" min="0.6" max="1.6" step="0.02"><span id="zoomv"></span></div>
-  <div class="row"><span>レンズの間隔</span><input id="sep" type="range" min="50" max="75" step="0.5"><span id="sepv"></span></div>
-  <div class="row"><span>上下の位置</span><input id="vy" type="range" min="-15" max="15" step="0.5"><span id="vyv"></span></div>
-  <div class="row"><span>ゆがみ補正</span><input id="k" type="range" min="0" max="2" step="0.05"><span id="kv"></span></div>
-  <div class="row"><span>見える広さ</span><input id="dist" type="range" min="30" max="50" step="0.5"><span id="distv"></span></div>
+  <div id="ctl"></div>
   <div class="btns"><div id="reset">元に戻す</div><div id="go">はじめる</div></div>
   <div class="s" id="note"></div>
   <div class="s" id="ver" style="text-align:right;margin:0"></div>
@@ -49,7 +49,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-25.5";
+const VERSION = "2026-11-25.6";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -392,13 +392,64 @@ requestAnimationFrame(frame);
 
 /* ---------- the adjust panel ---------- */
 const panel = document.getElementById("panel");
-const fields = { sep: v => v.toFixed(1) + "mm", vy: v => (v > 0 ? "+" : "") + v.toFixed(1) + "mm", k: v => "×" + v.toFixed(2), dist: v => v.toFixed(1), zoom: v => "×" + v.toFixed(2) };
-function showVals() {
-  for (const id in fields) { document.getElementById(id).value = S[id]; document.getElementById(id + "v").textContent = fields[id](S[id]); }
-  for (const b of document.querySelectorAll("#modes div")) b.classList.toggle("on", b.dataset.m === S.mode);
-  document.getElementById("camrow").classList.toggle("on", S.mode !== "scene");
+// the controls: name, step per press, limits, how the value is shown
+const CTL = [
+  { id: "zoom", nm: "カメラの大きさ", step: 0.05, min: 0.6, max: 1.6, fmt: v => "×" + v.toFixed(2), cam: true },
+  { id: "sep",  nm: "レンズの間隔",   step: 0.5,  min: 50,  max: 75,  fmt: v => v.toFixed(1) + "mm" },
+  { id: "vy",   nm: "上下の位置",     step: 0.5,  min: -15, max: 15,  fmt: v => (v > 0 ? "+" : "") + v.toFixed(1) + "mm" },
+  { id: "k",    nm: "ゆがみ補正",     step: 0.05, min: 0,   max: 2,   fmt: v => "×" + v.toFixed(2) },
+  { id: "dist", nm: "見える広さ",     step: 0.5,  min: 30,  max: 50,  fmt: v => v.toFixed(1) },
+];
+const ctlBox = document.getElementById("ctl");
+for (const c of CTL) {
+  const row = document.createElement("div"); row.className = "row"; row.id = "row-" + c.id;
+  row.innerHTML = '<span></span><div class="pm">−</div><span class="val"></span><div class="pm">＋</div>';
+  row.firstChild.textContent = c.nm;
+  const [minus, , plus] = [row.children[1], row.children[2], row.children[3]];
+  const bump = dir => {
+    S[c.id] = Math.round(Math.min(c.max, Math.max(c.min, S[c.id] + dir * c.step)) / c.step) * c.step;
+    showVals(); save();
+  };
+  // one press = one step; holding repeats after 0.4 s, every 0.08 s
+  for (const [b, dir] of [[minus, -1], [plus, 1]]) {
+    let t1 = 0, t2 = 0;
+    const stop = () => { clearTimeout(t1); clearInterval(t2); };
+    b.addEventListener("pointerdown", e => { e.preventDefault(); bump(dir); stop(); t1 = setTimeout(() => { t2 = setInterval(() => bump(dir), 80); }, 400); });
+    for (const ev of ["pointerup", "pointerleave", "pointercancel"]) b.addEventListener(ev, stop);
+  }
+  ctlBox.appendChild(row);
 }
-for (const id in fields) document.getElementById(id).addEventListener("input", e => { S[id] = parseFloat(e.target.value); showVals(); save(); });
+function showVals() {
+  for (const c of CTL) {
+    document.querySelector("#row-" + c.id + " .val").textContent = c.fmt(S[c.id]);
+    document.getElementById("row-" + c.id).style.display = c.cam && S.mode === "scene" ? "none" : "";
+  }
+  for (const b of document.querySelectorAll("#modes div")) b.classList.toggle("on", b.dataset.m === S.mode);
+  drawGuide();
+}
+
+/* yellow crosses on each lens centre while the panel is open, so the spacing can be judged without the goggles */
+const gcv = document.getElementById("guide"), gctx = gcv.getContext("2d");
+function drawGuide() {
+  const dpr = devicePixelRatio || 1;
+  gcv.width = Math.round(innerWidth * dpr); gcv.height = Math.round(innerHeight * dpr);
+  gctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  gctx.clearRect(0, 0, innerWidth, innerHeight);
+  if (document.getElementById("panel").classList.contains("off")) return;
+  const mm = PX_PER_MM, cy = innerHeight / 2 - S.vy * mm;
+  gctx.strokeStyle = "#ffd84a"; gctx.lineWidth = 2;
+  for (const side of [-1, 1]) {
+    const cx = innerWidth / 2 + side * S.sep / 2 * mm;
+    gctx.beginPath();
+    gctx.moveTo(cx - 12 * mm, cy); gctx.lineTo(cx + 12 * mm, cy);
+    gctx.moveTo(cx, cy - 12 * mm); gctx.lineTo(cx, cy + 12 * mm);
+    gctx.stroke();
+    gctx.beginPath(); gctx.arc(cx, cy, 8 * mm, 0, 2 * Math.PI); gctx.stroke();
+  }
+  gctx.strokeStyle = "rgba(255,255,255,.35)"; gctx.lineWidth = 1;
+  gctx.beginPath(); gctx.moveTo(innerWidth / 2, 0); gctx.lineTo(innerWidth / 2, innerHeight); gctx.stroke();
+}
+addEventListener("resize", drawGuide);
 for (const b of document.querySelectorAll("#modes div")) b.addEventListener("click", async () => {
   S.mode = b.dataset.m; save(); showVals();
   document.getElementById("note").textContent = "";
@@ -428,6 +479,7 @@ document.getElementById("go").addEventListener("click", async () => {
     setTimeout(doRecenter, 400);
   }
   panel.classList.add("off");
+  drawGuide();
 });
 
 /* ---------- touch: drag to look (PC / no sensor), 1 tap = adjust panel, 2 taps = recenter ---------- */
@@ -446,7 +498,7 @@ cv.addEventListener("pointerup", () => {
   const n = performance.now();
   if (n - lastTap < 350) { clearTimeout(tapTimer); lastTap = 0; doRecenter(); return; }
   lastTap = n;
-  tapTimer = setTimeout(() => panel.classList.remove("off"), 360);
+  tapTimer = setTimeout(() => { panel.classList.remove("off"); drawGuide(); }, 360);
 });
 addEventListener("pointerup", () => { drag = null; });
 </script>
