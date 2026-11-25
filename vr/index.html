@@ -10,29 +10,46 @@
 <style>
   html, body { margin:0; height:100%; background:#000; overflow:hidden; touch-action:none; -webkit-user-select:none; user-select:none; }
   canvas { position:fixed; inset:0; width:100vw; height:100vh; height:100dvh; image-rendering:pixelated; image-rendering:crisp-edges; }
-  #start { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; background:rgba(0,0,0,.82); color:#e8e6e1; font-family:system-ui, -apple-system, "Hiragino Sans", sans-serif; text-align:center; padding:24px; }
-  #start b { font-size:22px; }
-  #start .s { font-size:14px; color:#9aa0ab; line-height:1.7; }
-  #start .go { margin-top:8px; padding:14px 28px; border-radius:14px; background:#7fb4ff; color:#0b0b0a; font-weight:bold; font-size:18px; }
-  #start.off { display:none; }
+  #panel { position:fixed; left:50%; bottom:0; transform:translateX(-50%); width:min(560px, 100vw); max-height:100dvh; overflow:auto; background:rgba(14,15,18,.9); color:#e8e6e1; font-family:system-ui, -apple-system, "Hiragino Sans", sans-serif; padding:12px 16px 14px; border-radius:16px 16px 0 0; box-sizing:border-box; }
+  #panel.off { display:none; }
+  #panel b { font-size:17px; }
+  #panel .s { font-size:12px; color:#9aa0ab; line-height:1.6; margin:4px 0 8px; }
+  .row { display:grid; grid-template-columns:7.5em 1fr 3.6em; align-items:center; gap:8px; font-size:13px; margin:4px 0; }
+  .row input { width:100%; }
+  .row span:last-child { text-align:right; color:#9aa0ab; font-variant-numeric:tabular-nums; }
+  .btns { display:flex; gap:8px; margin-top:10px; }
+  .btns div { flex:1; text-align:center; padding:11px 0; border-radius:12px; font-weight:bold; font-size:15px; }
+  #go { background:#7fb4ff; color:#0b0b0a; }
+  #reset { background:#252832; flex:0 0 7em !important; font-weight:normal !important; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="start">
+<div id="panel">
   <b>夜の川辺</b>
-  <div class="s">スマホを横向きにして、ゴーグルに入れてください。<br>首を動かすと見回せます。画面をダブルタップすると、いま向いている方が正面になります。</div>
-  <div class="go" id="go">はじめる</div>
+  <div class="s">横向きにしてゴーグルに入れると、首の動きで見回せます。左右の丸がそれぞれのレンズの真ん中に来るように合わせてください。<br>ゴーグルの中で：画面を1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
+  <div class="row"><span>レンズの間隔</span><input id="sep" type="range" min="50" max="75" step="0.5"><span id="sepv"></span></div>
+  <div class="row"><span>上下の位置</span><input id="vy" type="range" min="-15" max="15" step="0.5"><span id="vyv"></span></div>
+  <div class="row"><span>ゆがみ補正</span><input id="k" type="range" min="0" max="2" step="0.05"><span id="kv"></span></div>
+  <div class="row"><span>見える広さ</span><input id="dist" type="range" min="30" max="50" step="0.5"><span id="distv"></span></div>
+  <div class="btns"><div id="reset">元に戻す</div><div id="go">はじめる</div></div>
   <div class="s" id="note"></div>
 </div>
 <script>
 "use strict";
 /* ---------- settings (tunable) ---------- */
-const EYE_H = 180;          // render height per eye in pixels (lower = chunkier pixels, faster)
-const TAN_Y = 1.0;          // vertical half-FOV as tan (1.0 = 90 deg total)
-const IPD = 0.064;          // distance between the eyes in metres
+const EYE_H = 200;          // canvas height in pixels (lower = chunkier pixels, faster)
+const PX_PER_MM = 6.04;     // CSS pixels per millimetre on the phone screen (recent iPhones: 460 ppi / 3)
+const IPD = 0.064;          // distance between the eyes in the scene, metres (depth of the snow)
 const EYE_HEIGHT = 1.6;     // how high the eyes are above the snow
 const SNOW_N = 450;         // snowflakes
+const K1 = 0.34, K2 = 0.55; // lens distortion (Cardboard's usual values), scaled by the "ゆがみ補正" slider
+const MAX_TAN = 1.25;       // beyond this angle from the lens centre, draw black
+// the viewer: lens spacing (mm), lens centre up/down from the screen middle (mm), distortion scale, screen-to-lens distance (mm)
+const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39 };
+let S = Object.assign({}, DEFAULTS);
+try { Object.assign(S, JSON.parse(localStorage.getItem("vrcfg") || "{}")); } catch (e) {}
+function save() { try { localStorage.setItem("vrcfg", JSON.stringify(S)); } catch (e) {} }
 
 /* ---------- small math ---------- */
 const PI = Math.PI;
@@ -55,11 +72,10 @@ function hash3(x, y, z) {
 }
 
 /* ---------- head orientation ---------- */
-// The phone's sensor angles become a rotation for a camera looking out of the back of the screen (as three.js does it).
 let devQ = null, hasGyro = false;
 let recenter = [0, 0, 0, 1];
 let dragYaw = 0, dragPitch = 0;
-const Q_BACK = [-Math.SQRT1_2, 0, 0, Math.SQRT1_2];   // -90 deg about X
+const Q_BACK = [-Math.SQRT1_2, 0, 0, Math.SQRT1_2];   // -90 deg about X: the camera looks out of the back of the phone
 function onOrient(e) {
   if (e.alpha == null) return;
   hasGyro = true;
@@ -88,7 +104,6 @@ function farH(az) { return (6.5 + 3 * Math.sin(3*az + 1) + 2 * Math.sin(7*az + 2
 function nearH(az) { return (2.8 + 2.2 * Math.sin(5*az + 4) + 1.3 * Math.sin(11*az + 1) + 0.5 * Math.sin(29*az)) * DEG; }
 
 let T = 0;
-// colour of what lies in direction (dx,dy,dz) far away (sky, stars, moon, mountains) -> [r,g,b]
 function sky(dx, dy, dz, out) {
   const el = Math.asin(Math.max(-1, Math.min(1, dy)));
   const az = Math.atan2(dx, -dz);
@@ -102,14 +117,11 @@ function sky(dx, dy, dz, out) {
     if (hf > 9 * DEG && el > hf - 1.3 * DEG) { out[0] = 120; out[1] = 132; out[2] = 165; return; }
     out[0] = 26; out[1] = 32; out[2] = 56; return;
   }
-  // sky gradient
   const k = Math.min(1, Math.max(0, el / (PI / 2)));
   let r = 24 - 18 * k, g = 32 - 24 * k, b = 64 - 40 * k;
-  // moon and its glow
   const m = dx * MOON[0] + dy * MOON[1] + dz * MOON[2];
   if (m > MOON_COS) { out[0] = 236; out[1] = 230; out[2] = 196; return; }
   if (m > GLOW_COS) { const gl = (m - GLOW_COS) / (MOON_COS - GLOW_COS); r += 40 * gl * gl; g += 40 * gl * gl; b += 46 * gl * gl; }
-  // stars: a fixed grid on the sphere, a few cells lit, each twinkling at its own pace
   const N = 150, ix = Math.floor((dx + 1) * N), iy = Math.floor((dy + 1) * N), iz = Math.floor((dz + 1) * N);
   const h = hash3(ix, iy, iz);
   if (h < 0.012 + 0.01 * k) {
@@ -123,29 +135,25 @@ function sky(dx, dy, dz, out) {
 function riverZ(x) { return -9 + 2.2 * Math.sin(x * 0.045 + 0.6) + 0.8 * Math.sin(x * 0.13); }
 const RIVER_HALF = 2.6;
 const tmp = [0, 0, 0];
-// colour seen from eye (ex,ey,ez) along unit direction (dx,dy,dz)
 function shade(ex, ey, ez, dx, dy, dz, out) {
   if (dy >= -0.002) { sky(dx, dy, dz, out); return; }
-  const t = (ey + EYE_HEIGHT) / -dy;            // the snow is at y = -EYE_HEIGHT
+  const t = (ey + EYE_HEIGHT) / -dy;
   const px = ex + dx * t, pz = ez + dz * t;
   const fog = 1 - Math.exp(-t / 70);
   const zc = riverZ(px), dist = Math.abs(pz - zc);
   let r, g, b;
   if (dist < RIVER_HALF) {
-    // water: the sky mirrored, rippling
     const wob = 0.018 * Math.sin(px * 1.7 + T * 1.6) + 0.012 * Math.sin(pz * 2.3 - T * 1.1);
     sky(dx + wob, -dy, dz, tmp);
     r = tmp[0] * 0.55 + 4; g = tmp[1] * 0.6 + 8; b = tmp[2] * 0.7 + 16;
-    // flowing glints
     const gl = hash3(Math.floor(px * 3 - T * 4), Math.floor(pz * 6), 7);
     if (gl > 0.985) { r += 40; g += 46; b += 60; }
   } else if (dist < RIVER_HALF + 0.35) {
-    r = 30; g = 34; b = 44;                     // the dark bank
+    r = 30; g = 34; b = 44;
   } else {
     const n = (hash3(Math.floor(px * 2), Math.floor(pz * 2), 3) - 0.5) * 14;
-    r = 118 + n; g = 128 + n; b = 158 + n;      // moonlit snow
+    r = 118 + n; g = 128 + n; b = 158 + n;
   }
-  // fade toward the horizon colour
   out[0] = r + (20 - r) * fog; out[1] = g + (26 - g) * fog; out[2] = b + (48 - b) * fog;
 }
 
@@ -161,96 +169,143 @@ function stepSnow(dt) {
   }
 }
 
-/* ---------- rendering ---------- */
+/* ---------- the lenses: which way each screen pixel looks ----------
+   Each pixel's place on the screen (in mm) is measured from its lens centre. The lens bends it outward
+   (r_screen = r * (1 + k1 r^2 + k2 r^4)), so we undo that to find the true angle and draw what lies there.
+   Through the lens the picture then looks straight again and the right size. */
 const cv = document.getElementById("c");
 const ctx = cv.getContext("2d");
-let W = 0, H = 0, img = null, px32 = null;
-function resize() {
-  const aspect = (innerWidth / 2) / innerHeight;
-  H = EYE_H; W = Math.max(40, Math.round(H * aspect));
-  cv.width = W * 2; cv.height = H;
-  img = ctx.createImageData(W * 2, H);
-  px32 = new Uint32Array(img.data.buffer);
+let W = 0, H = 0, img = null, px32 = null, lutU = null, lutV = null, lutS = null;
+let mmW = 0, mmH = 0, lensX = [0, 0], lensY = 0, k1 = K1, k2 = K2;
+function undistort(rs) {           // screen tan-radius -> true tan-radius (Newton)
+  let r = rs;
+  for (let n = 0; n < 8; n++) {
+    const r2 = r * r, f = r * (1 + k1 * r2 + k2 * r2 * r2) - rs, d = 1 + 3 * k1 * r2 + 5 * k2 * r2 * r2;
+    r -= f / d;
+  }
+  return r;
 }
-addEventListener("resize", resize);
-resize();
+function build() {
+  H = EYE_H; W = Math.max(80, Math.round(H * innerWidth / innerHeight));
+  cv.width = W; cv.height = H;
+  img = ctx.createImageData(W, H);
+  px32 = new Uint32Array(img.data.buffer);
+  lutU = new Float32Array(W * H); lutV = new Float32Array(W * H); lutS = new Int8Array(W * H);
+  mmW = innerWidth / PX_PER_MM; mmH = innerHeight / PX_PER_MM;
+  lensX = [mmW / 2 - S.sep / 2, mmW / 2 + S.sep / 2]; lensY = mmH / 2 - S.vy;
+  k1 = K1 * S.k; k2 = K2 * S.k;
+  for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) {
+    const k = j * W + i;
+    const xm = (i + 0.5) / W * mmW, ym = (j + 0.5) / H * mmH;
+    const side = xm < mmW / 2 ? 0 : 1;
+    const tx = (xm - lensX[side]) / S.dist, ty = (lensY - ym) / S.dist;
+    const rs = Math.hypot(tx, ty);
+    const ru = rs > 0 ? undistort(rs) : 0;
+    if (ru > MAX_TAN || !(ru >= 0)) { lutS[k] = 0; continue; }
+    const s = rs > 0 ? ru / rs : 1;
+    lutU[k] = tx * s; lutV[k] = ty * s; lutS[k] = side === 0 ? -1 : 1;
+  }
+}
+// true tan-angles (tx, ty) for one eye -> canvas pixel, or -1
+function toPixel(side, tx, ty) {
+  const r2 = tx * tx + ty * ty, f = 1 + k1 * r2 + k2 * r2 * r2;
+  const xm = lensX[side < 0 ? 0 : 1] + tx * f * S.dist, ym = lensY - ty * f * S.dist;
+  const i = Math.floor(xm / mmW * W), j = Math.floor(ym / mmH * H);
+  if (i < 0 || i >= W || j < 0 || j >= H) return -1;
+  const k = j * W + i;
+  return lutS[k] === side ? k : -1;
+}
+addEventListener("resize", build);
+build();
 
 const col = [0, 0, 0];
-function renderEye(q, side) {
+function render(q) {
   const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
-  const off = side * IPD / 2;
-  const ex = R[0] * off, ey = R[1] * off, ez = R[2] * off;
-  const tanX = TAN_Y * W / H, x0 = side < 0 ? 0 : W;
-  for (let j = 0; j < H; j++) {
-    const v = (1 - 2 * (j + 0.5) / H) * TAN_Y;
-    const bx = F[0] + U[0] * v, by = F[1] + U[1] * v, bz = F[2] + U[2] * v;
-    let o = j * W * 2 + x0;
-    for (let i = 0; i < W; i++) {
-      const u = (2 * (i + 0.5) / W - 1) * tanX;
-      let dx = bx + R[0] * u, dy = by + R[1] * u, dz = bz + R[2] * u;
-      const l = 1 / Math.sqrt(dx*dx + dy*dy + dz*dz); dx *= l; dy *= l; dz *= l;
-      shade(ex, ey, ez, dx, dy, dz, col);
-      px32[o++] = 0xff000000 | (Math.min(255, col[2]) << 16) | (Math.min(255, col[1]) << 8) | Math.min(255, col[0]);
+  const o = IPD / 2;
+  const eL = [-R[0] * o, -R[1] * o, -R[2] * o], eR = [R[0] * o, R[1] * o, R[2] * o];
+  const n = W * H;
+  for (let k = 0; k < n; k++) {
+    const s = lutS[k];
+    if (s === 0) { px32[k] = 0xff000000; continue; }
+    const u = lutU[k], v = lutV[k], e = s < 0 ? eL : eR;
+    let dx = F[0] + R[0] * u + U[0] * v, dy = F[1] + R[1] * u + U[1] * v, dz = F[2] + R[2] * u + U[2] * v;
+    const l = 1 / Math.sqrt(dx*dx + dy*dy + dz*dz); dx *= l; dy *= l; dz *= l;
+    shade(e[0], e[1], e[2], dx, dy, dz, col);
+    px32[k] = 0xff000000 | (Math.min(255, col[2]) << 16) | (Math.min(255, col[1]) << 8) | Math.min(255, col[0]);
+  }
+  // snowflakes for each eye (near ones bigger, shifted between the eyes = depth)
+  for (const side of [-1, 1]) {
+    const e = side < 0 ? eL : eR;
+    for (const f of flakes) {
+      const rx = f.x - e[0], ry = f.y - e[1], rz = f.z - e[2];
+      const cz = rx * F[0] + ry * F[1] + rz * F[2];
+      if (cz < 0.3) continue;
+      const cx = rx * R[0] + ry * R[1] + rz * R[2], cy = rx * U[0] + ry * U[1] + rz * U[2];
+      const k = toPixel(side, cx / cz, cy / cz);
+      if (k < 0) continue;
+      px32[k] = 0xfff4eee8;
+      if (cz < 2.5) { if (k + 1 < n && lutS[k + 1] === side) px32[k + 1] = 0xfff4eee8; if (k + W < n && lutS[k + W] === side) px32[k + W] = 0xfff4eee8; }
     }
   }
-  // snowflakes, seen from this eye (near ones bigger, and shifted between the eyes = depth)
-  for (const f of flakes) {
-    const rx = f.x - ex, ry = f.y - ey, rz = f.z - ez;
-    const cz = rx * F[0] + ry * F[1] + rz * F[2];
-    if (cz < 0.3) continue;
-    const cx = rx * R[0] + ry * R[1] + rz * R[2], cy = rx * U[0] + ry * U[1] + rz * U[2];
-    const sx = Math.floor((cx / cz / tanX * 0.5 + 0.5) * W), sy = Math.floor((0.5 - cy / cz / TAN_Y * 0.5) * H);
-    const sz = cz < 2.5 ? 2 : 1;
-    for (let yy = 0; yy < sz; yy++) for (let xx = 0; xx < sz; xx++) {
-      const X = sx + xx, Y = sy + yy;
-      if (X >= 0 && X < W && Y >= 0 && Y < H) px32[Y * W * 2 + x0 + X] = 0xfff4eee8;
-    }
-  }
-  // the line between the eyes
-  if (side > 0) for (let j = 0; j < H; j++) px32[j * W * 2 + W] = 0xff000000;
 }
 
 let last = performance.now();
 function frame(now) {
   const dt = Math.min(0.1, (now - last) / 1000); last = now; T += dt;
   stepSnow(dt);
-  const q = headQ();
-  renderEye(q, -1);
-  renderEye(q, +1);
+  render(headQ());
   ctx.putImageData(img, 0, 0);
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
 
-/* ---------- start, permissions, input ---------- */
-let wake = null;
-async function keepAwake() {
-  try { if (navigator.wakeLock) wake = await navigator.wakeLock.request("screen"); } catch (e) {}
-}
+/* ---------- the adjust panel ---------- */
+const panel = document.getElementById("panel");
+const fields = { sep: v => v.toFixed(1) + "mm", vy: v => (v > 0 ? "+" : "") + v.toFixed(1) + "mm", k: v => "×" + v.toFixed(2), dist: v => v.toFixed(1) };
+function showVals() { for (const id in fields) { document.getElementById(id).value = S[id]; document.getElementById(id + "v").textContent = fields[id](S[id]); } }
+for (const id in fields) document.getElementById(id).addEventListener("input", e => { S[id] = parseFloat(e.target.value); showVals(); build(); save(); });
+document.getElementById("reset").addEventListener("click", () => { S = Object.assign({}, DEFAULTS); showVals(); build(); save(); });
+showVals();
+
+let wake = null, started = false;
+async function keepAwake() { try { if (navigator.wakeLock) wake = await navigator.wakeLock.request("screen"); } catch (e) {} }
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && wake) keepAwake(); });
 document.getElementById("go").addEventListener("click", async () => {
-  try {
-    if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
-      const r = await DeviceOrientationEvent.requestPermission();
-      if (r !== "granted") document.getElementById("note").textContent = "首の動きが許可されませんでした。指でドラッグして見回せます。";
-    }
-  } catch (e) {}
-  addEventListener("deviceorientation", onOrient);
-  keepAwake();
-  document.getElementById("start").classList.add("off");
-  setTimeout(doRecenter, 400);
+  if (!started) {
+    try {
+      if (typeof DeviceOrientationEvent !== "undefined" && typeof DeviceOrientationEvent.requestPermission === "function") {
+        const r = await DeviceOrientationEvent.requestPermission();
+        if (r !== "granted") document.getElementById("note").textContent = "首の動きが許可されませんでした。指でドラッグして見回せます。";
+      }
+    } catch (e) {}
+    addEventListener("deviceorientation", onOrient);
+    keepAwake();
+    started = true;
+    document.getElementById("go").textContent = "つづける";
+    setTimeout(doRecenter, 400);
+  }
+  panel.classList.add("off");
 });
-// drag to look (PC, or when the sensor is not allowed)
-let drag = null;
-cv.addEventListener("pointerdown", e => { drag = { x: e.clientX, y: e.clientY, yaw: dragYaw, pitch: dragPitch }; });
+
+/* ---------- touch: drag to look (PC / no sensor), 1 tap = adjust panel, 2 taps = recenter ---------- */
+let drag = null, tapTimer = 0, lastTap = 0;
+cv.addEventListener("pointerdown", e => { drag = { x: e.clientX, y: e.clientY, yaw: dragYaw, pitch: dragPitch, moved: false }; });
 addEventListener("pointermove", e => {
-  if (!drag || hasGyro) return;
+  if (!drag) return;
+  if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 8) drag.moved = true;
+  if (hasGyro) return;
   dragYaw = drag.yaw + (e.clientX - drag.x) * 0.005;
   dragPitch = Math.max(-1.4, Math.min(1.4, drag.pitch + (e.clientY - drag.y) * 0.005));
 });
+cv.addEventListener("pointerup", () => {
+  const moved = drag && drag.moved; drag = null;
+  if (moved || !started) return;
+  const n = performance.now();
+  if (n - lastTap < 350) { clearTimeout(tapTimer); lastTap = 0; doRecenter(); return; }
+  lastTap = n;
+  tapTimer = setTimeout(() => panel.classList.remove("off"), 360);
+});
 addEventListener("pointerup", () => { drag = null; });
-let lastTap = 0;
-cv.addEventListener("pointerup", () => { const n = performance.now(); if (n - lastTap < 350) doRecenter(); lastTap = n; });
 </script>
 </body>
 </html>
