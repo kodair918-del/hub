@@ -27,8 +27,8 @@
   .modes { display:flex; gap:6px; margin:6px 0 8px; }
   .modes div { flex:1; text-align:center; padding:8px 0; border-radius:10px; background:#252832; font-size:13px; }
   .modes div.on { background:#7fb4ff; color:#0b0b0a; font-weight:bold; }
-  #camrow { display:none; }
-  #camrow.on { display:grid; }
+  #togs div { flex:0 0 auto; padding:8px 16px; }
+  #togs div.on::before { content:"✓ "; }
   video { position:fixed; width:1px; height:1px; opacity:0; pointer-events:none; }
 </style>
 </head>
@@ -37,9 +37,10 @@
 <canvas id="guide"></canvas>
 <video id="vid" playsinline muted autoplay></video>
 <div id="panel">
-  <b>夜の川辺</b>
+  <b>VR</b>
   <div class="s">黄色い十字が、それぞれのレンズの真ん中に来るように合わせてください（押し続けると連続で動きます）。<br>ゴーグルの中で：画面を1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
-  <div class="modes" id="modes"><div data-m="scene">夜の川辺</div><div data-m="cam">カメラ</div><div data-m="camsnow">カメラ＋雪</div></div>
+  <div class="modes" id="modes"><div data-m="river">夜の川辺</div><div data-m="sunset">夕焼けの海</div><div data-m="meadow">昼の草原</div><div data-m="space">宇宙</div><div data-m="cam">カメラ</div></div>
+  <div class="modes" id="togs"><div data-t="snow">雪</div><div data-t="me">自分を映す</div></div>
   <div id="ctl"></div>
   <div class="btns"><div id="reset">元に戻す</div><div id="go">はじめる</div></div>
   <div class="s" id="note"></div>
@@ -49,7 +50,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-25.6";
+const VERSION = "2026-11-25.7";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -77,10 +78,20 @@ const K1 = 0.34, K2 = 0.55; // lens distortion (Cardboard's usual values), scale
 const MAX_TAN = 1.25;       // beyond this angle from the lens centre, draw black
 const CAM_TAN_H = Math.tan(34 * Math.PI / 180);   // half of the 1x camera's horizontal view (about 68 deg across)
 // sep: lens spacing (mm), vy: lens centre up/down (mm), k: distortion scale, dist: screen-to-lens (mm),
-// zoom: camera picture size (1 = true size), mode: scene | cam | camsnow
-const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39, zoom: 1, mode: "scene" };
+// zoom: camera picture size (1 = true size), place: river | sunset | meadow | space | cam,
+// snow: snowflakes on/off, me: cut the body out of the camera picture and put it in the place
+const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39, zoom: 1, place: "river", snow: true, me: false };
+const PLACES = ["river", "sunset", "meadow", "space", "cam"];
 let S = Object.assign({}, DEFAULTS);
 try { Object.assign(S, JSON.parse(localStorage.getItem("vrcfg") || "{}")); } catch (e) {}
+if (S.mode) {   // settings saved by the older page
+  S.place = S.mode === "scene" ? "river" : "cam"; S.snow = S.mode !== "cam"; delete S.mode;
+}
+if (!PLACES.includes(S.place)) S.place = "river";
+const SEG_THRESHOLD = [0.45, 0.7];   // mask values between these fade from place to camera (the body's edge)
+// the person-cutout model (MediaPipe, runs on the phone; nothing is sent anywhere)
+const MP_VER = "0.10.14";
+const SEG_MODEL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
 function save() { try { localStorage.setItem("vrcfg", JSON.stringify(S)); } catch (e) {} }
 
 /* ---------- small math ---------- */
@@ -137,10 +148,11 @@ in vec2 aP; void main() { gl_Position = vec4(aP, 0.0, 1.0); }`;
 const FS_MAIN = `#version 300 es
 precision highp float;
 uniform vec2 uRes, uMm, uCamTan;
-uniform float uSep, uVy, uDist, uK1, uK2, uMaxTan, uOff, uT, uEyeH, uCamOk;
+uniform float uSep, uVy, uDist, uK1, uK2, uMaxTan, uOff, uT, uEyeH, uCamOk, uMe, uMaskOk;
+uniform vec2 uSegTh;
 uniform vec3 uR, uU, uF;
-uniform int uMode;
-uniform sampler2D uCam;
+uniform int uMode, uScene;
+uniform sampler2D uCam, uMask;
 out vec4 o;
 const float PI = 3.14159265, DEG = PI / 180.0;
 
@@ -210,6 +222,140 @@ vec3 shade(vec3 e, vec3 d) {
   return mix(c, vec3(20, 26, 48), fog);
 }
 
+/* ---- value noise for clouds and nebulae ---- */
+float vn(vec3 p) {
+  vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  float a = mix(mix(h3(i), h3(i + vec3(1,0,0)), f.x), mix(h3(i + vec3(0,1,0)), h3(i + vec3(1,1,0)), f.x), f.y);
+  float b = mix(mix(h3(i + vec3(0,0,1)), h3(i + vec3(1,0,1)), f.x), mix(h3(i + vec3(0,1,1)), h3(i + vec3(1,1,1)), f.x), f.y);
+  return mix(a, b, f.z);
+}
+float fbm(vec3 p) { float s = 0.0, a = 0.5; for (int i = 0; i < 5; i++) { s += a * vn(p); p *= 2.03; a *= 0.5; } return s; }
+
+/* ---- sunset sea: standing on a beach, the sun just above the sea ---- */
+const vec3 SUN_SET = vec3(0.0, 0.0523, -0.9986);
+vec3 skySunset(vec3 d) {
+  float el = asin(clamp(d.y, -1.0, 1.0)), az = atan(d.x, -d.z);
+  // two low islands far away
+  float isl = max(0.0, 1.6 * sin(2.0*az + 2.2) - 0.6) * (1.0 + 0.3*sin(13.0*az)) * DEG;
+  if (el < isl) return vec3(60, 38, 62);
+  float k = clamp(el / 1.2, 0.0, 1.0);
+  float toward = 0.5 + 0.5 * dot(normalize(vec2(d.x, d.z) + 1e-5), vec2(0.0, -1.0));   // 1 = toward the sun
+  vec3 low = mix(vec3(190, 90, 110), vec3(255, 150, 70), toward);
+  vec3 c = mix(low, vec3(70, 50, 120), smoothstep(0.0, 0.45, k));
+  c = mix(c, vec3(22, 20, 58), smoothstep(0.4, 1.0, k));
+  float m = dot(d, SUN_SET);
+  if (m > cos(2.2*DEG)) return vec3(255, 236, 190);
+  c += vec3(255, 170, 90) * pow(max(m, 0.0), 60.0) * 0.8;
+  // thin streaks of cloud lit from below
+  if (d.y > 0.01) {
+    vec2 p = d.xz / d.y;
+    float cl = smoothstep(0.55, 0.75, fbm(vec3(p.x * 0.6, p.y * 3.0, 1.0)));
+    c = mix(c, mix(vec3(255, 120, 90), vec3(120, 60, 110), k * 2.0), cl * 0.75 * (1.0 - k));
+  }
+  // first stars high up
+  if (k > 0.6) { vec3 q = (d + 1.0) * 420.0, cell = floor(q); float h = h3(cell);
+    if (h < 0.003) c = max(c, vec3(200) * (1.0 - smoothstep(0.15, 0.5, length(q - cell - 0.5))) * (k - 0.6) * 2.5); }
+  return c;
+}
+vec3 shadeSunset(vec3 e, vec3 d) {
+  if (d.y >= -0.002) return skySunset(d);
+  float t = min((e.y + uEyeH) / -d.y, 4000.0);
+  float px = e.x + d.x * t, pz = e.z + d.z * t;
+  float shore = -5.0 + 0.5 * sin(px * 0.35) + 0.35 * sin(px * 1.3 + uT * 0.9);
+  vec3 c;
+  if (pz > shore) {
+    float wet = smoothstep(shore + 1.2, shore, pz);
+    float n = (h3(vec3(floor(px * 6.0), floor(pz * 6.0), 5.0)) - 0.5) * 10.0;
+    c = mix(vec3(196, 138, 112), vec3(120, 78, 80), wet) + n;
+    if (pz < shore + 0.25) c = mix(c, vec3(240, 210, 200), 0.6);   // foam line
+  } else {
+    float wob = 0.03 * sin(px * 1.1 + uT * 1.3) + 0.02 * sin(pz * 1.7 - uT * 1.7);
+    vec3 r = normalize(vec3(d.x + wob, -d.y, d.z));
+    c = skySunset(r) * 0.62 + vec3(10, 6, 24);
+    // the sun's glittering path
+    if (dot(r, SUN_SET) > 0.985 && h3(vec3(floor(px * 4.0 + uT * 3.0), floor(pz * 2.0), 9.0)) > 0.8) c += vec3(120, 90, 50);
+  }
+  return mix(c, vec3(210, 110, 100), 1.0 - exp(-t / 160.0));
+}
+
+/* ---- daytime meadow: blue sky, drifting clouds, green hills, flowers ---- */
+const vec3 SUN_DAY = vec3(0.35, 0.75, -0.56);
+vec3 skyMeadow(vec3 d) {
+  float el = asin(clamp(d.y, -1.0, 1.0)), az = atan(d.x, -d.z);
+  if (el < nearH(az) * 0.8) return el < 0.0 ? vec3(120, 160, 110) : vec3(78, 126, 70);
+  if (el < farH(az) * 0.9) return vec3(118, 150, 120);
+  float k = clamp(el / 1.4, 0.0, 1.0);
+  vec3 c = mix(vec3(196, 222, 246), vec3(80, 140, 230), smoothstep(0.0, 0.6, k));
+  float m = dot(d, normalize(SUN_DAY));
+  if (m > cos(2.0*DEG)) return vec3(255, 252, 235);
+  c += vec3(255, 240, 200) * pow(max(m, 0.0), 30.0) * 0.5;
+  if (d.y > 0.02) {
+    vec2 p = d.xz / d.y * 0.35 + vec2(uT * 0.02, 0.0);
+    float cl = smoothstep(0.5, 0.72, fbm(vec3(p, 3.0)));
+    c = mix(c, vec3(250, 250, 252) - 30.0 * smoothstep(0.6, 0.85, fbm(vec3(p * 1.5, 7.0))), cl * smoothstep(0.02, 0.15, d.y));
+  }
+  return c;
+}
+vec3 shadeMeadow(vec3 e, vec3 d) {
+  if (d.y >= -0.002) return skyMeadow(d);
+  float t = min((e.y + uEyeH) / -d.y, 4000.0);
+  float px = e.x + d.x * t, pz = e.z + d.z * t;
+  float n = vn(vec3(px * 0.15, pz * 0.15, 2.0));
+  vec3 c = mix(vec3(70, 128, 52), vec3(110, 160, 64), n);
+  c += (h3(vec3(floor(px * 8.0), floor(pz * 8.0), 4.0)) - 0.5) * 18.0;
+  // flowers close by
+  if (t < 25.0) {
+    vec3 cell = vec3(floor(px * 2.5), floor(pz * 2.5), 6.0);
+    float h = h3(cell);
+    if (h < 0.08) {
+      vec2 f = vec2(px * 2.5, pz * 2.5) - cell.xy - 0.5;
+      if (length(f) < 0.16) c = h < 0.03 ? vec3(250, 250, 240) : h < 0.055 ? vec3(250, 210, 70) : vec3(240, 140, 180);
+    }
+  }
+  return mix(c, vec3(196, 222, 246), 1.0 - exp(-t / 260.0));
+}
+
+/* ---- space: floating among the stars, a ringed planet and a nebula ---- */
+const vec3 PLANET = vec3(-0.55, 0.25, -0.8);
+vec3 skySpace(vec3 d) {
+  vec3 c = vec3(2, 2, 8);
+  float neb = fbm(d * 2.2 + 4.0);
+  c += vec3(70, 30, 110) * smoothstep(0.45, 0.8, neb) + vec3(20, 60, 120) * smoothstep(0.5, 0.85, fbm(d * 3.1 + 9.0));
+  vec3 q = (d + 1.0) * 420.0, cell = floor(q);
+  float h = h3(cell);
+  if (h < 0.02) {
+    float dot_ = 1.0 - smoothstep(0.12, 0.5, length(q - cell - 0.5));
+    float br = 0.7 + 0.3 * sin(uT * (1.0 + h * 300.0) + h3(cell.zxy) * 6.283);
+    vec3 tint = mix(vec3(255, 210, 170), vec3(170, 200, 255), h3(cell.yzx));
+    c = max(c, tint * br * dot_ * (0.4 + 0.6 * h3(cell.xzy)));
+  }
+  // the planet: a sphere 18 degrees across, lit from the side, with bands
+  vec3 pc = normalize(PLANET);
+  float cosr = cos(18.0 * DEG);
+  float b = dot(d, pc);
+  // ring: a tilted disc around the planet
+  vec3 rn = normalize(vec3(-0.35, 1.0, 0.75));   // tilted toward us so the ring shows as an ellipse
+  float tr = dot(pc * 1.0 - vec3(0), rn) / dot(d, rn);
+  vec3 rp = d * tr - pc;
+  float rr = length(rp) / sin(18.0 * DEG);
+  bool ringFront = tr > 0.0 && rr > 1.25 && rr < 1.9;
+  if (b > cosr) {
+    // where on the sphere: distance along the ray to the surface (unit distance to the centre)
+    float s = sin(18.0 * DEG);
+    float tc = b, disc = s * s - (1.0 - b * b);
+    float th = tc - sqrt(max(disc, 0.0));
+    vec3 n = normalize(d * th - pc);
+    float lit = clamp(dot(n, normalize(vec3(0.8, 0.3, 0.5))), 0.0, 1.0);
+    float band = sin(dot(n, rn) * 22.0 + fbm(n * 4.0) * 3.0);
+    vec3 col = mix(vec3(200, 150, 110), vec3(150, 100, 80), 0.5 + 0.5 * band);
+    vec3 pcol = col * (0.08 + 0.92 * lit);
+    if (ringFront && tr < th) return mix(pcol, vec3(210, 190, 160) * (0.6 + 0.4 * sin(rr * 40.0)), 0.7);
+    return pcol;
+  }
+  if (ringFront) c = mix(c, vec3(210, 190, 160) * (0.6 + 0.4 * sin(rr * 40.0)), 0.6);
+  return c;
+}
+
 void main() {
   vec2 fc = gl_FragCoord.xy;
   float xm = fc.x / uRes.x * uMm.x, ym = (uRes.y - fc.y) / uRes.y * uMm.y;
@@ -230,8 +376,18 @@ void main() {
     return;
   }
   vec3 dir = normalize(uF + uR * tu.x + uU * tu.y);
-  vec3 c = shade(uR * side * uOff, dir);
-  o = vec4(min(c, 255.0) / 255.0, 1.0);
+  vec3 eye = uR * side * uOff;
+  vec3 c = uScene == 1 ? shadeSunset(eye, dir) : uScene == 2 ? shadeMeadow(eye, dir) : uScene == 3 ? skySpace(dir) : shade(eye, dir);
+  c = clamp(c, 0.0, 255.0) / 255.0;
+  // "me": where the cutout says there is a body, show the camera picture instead
+  if (uMe > 0.5 && uMaskOk > 0.5 && uCamOk > 0.5) {
+    vec2 uv = vec2(0.5 + tu.x / (2.0 * uCamTan.x), 0.5 - tu.y / (2.0 * uCamTan.y));
+    if (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) {
+      float a = smoothstep(uSegTh.x, uSegTh.y, texture(uMask, uv).r);
+      c = mix(c, texture(uCam, uv).rgb, a);
+    }
+  }
+  o = vec4(c, 1.0);
 }`;
 
 // snowflakes: each one is projected for each eye and pushed outward the way the lens pulls it in
@@ -300,6 +456,56 @@ gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
 
+const maskTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, maskTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, 1, 1, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array([0]));
+
+/* ---------- cutting the body out of the camera picture (MediaPipe's person segmenter) ---------- */
+let seg = null, segLoading = false, maskOk = 0, maskBuf = null, lastSegTs = 0;
+async function loadSeg() {
+  if (seg || segLoading) return;
+  segLoading = true;
+  const note = document.getElementById("note");
+  note.textContent = "体を切り抜くしくみを読み込んでいます…";
+  try {
+    const v = await import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/vision_bundle.mjs`);
+    const files = await v.FilesetResolver.forVisionTasks(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/wasm`);
+    const opts = d => ({ baseOptions: { modelAssetPath: SEG_MODEL, delegate: d }, runningMode: "VIDEO", outputCategoryMask: false, outputConfidenceMasks: true });
+    try { seg = await v.ImageSegmenter.createFromOptions(files, opts("GPU")); }
+    catch (e) { seg = await v.ImageSegmenter.createFromOptions(files, opts("CPU")); }
+    note.textContent = "";
+  } catch (e) {
+    note.textContent = "体を切り抜くしくみを読み込めませんでした（" + (e.message || e) + "）";
+  }
+  segLoading = false;
+}
+// one cutout per frame, from the newest camera picture; the mask goes into a texture the shader reads
+function runSeg() {
+  if (!seg || !camOn || vid.readyState < 2) return;
+  const ts = performance.now();
+  if (ts <= lastSegTs) return;
+  lastSegTs = ts;
+  try {
+    seg.segmentForVideo(vid, ts, res => {
+      const ms = res.confidenceMasks;
+      if (!ms || !ms.length) return;
+      const m = ms[ms.length - 1];          // the "person" channel is the last one
+      const f = m.getAsFloat32Array(), w = m.width, h = m.height;
+      if (!maskBuf || maskBuf.length !== w * h) maskBuf = new Uint8Array(w * h);
+      for (let i = 0; i < f.length; i++) maskBuf[i] = f[i] * 255;
+      gl.bindTexture(gl.TEXTURE_2D, maskTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, w, h, 0, gl.RED, gl.UNSIGNED_BYTE, maskBuf);
+      for (const x of ms) x.close();
+      maskOk = 1;
+    });
+  } catch (e) { /* a dropped frame is fine */ }
+}
+
 let mmW = 0, mmH = 0;
 function resize() {
   const sc = Math.min(RENDER_SCALE, devicePixelRatio || 1);
@@ -355,9 +561,11 @@ function frame(now) {
   const dt = Math.min(0.1, (now - last) / 1000); last = now; T += dt;
   const q = headQ();
   const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
-  const cam = S.mode !== "scene";
+  const cam = S.place === "cam";
+  const needCam = cam || S.me;
   let camOk = 0;
-  if (cam && camOn && vid.readyState >= 2 && vid.videoWidth) {
+  if (S.me && !cam) runSeg();
+  if (needCam && camOn && vid.readyState >= 2 && vid.videoWidth) {
     gl.bindTexture(gl.TEXTURE_2D, camTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, vid);
     camOk = 1;
@@ -369,12 +577,17 @@ function frame(now) {
   gl.uniform3f(u.uR, ...R); gl.uniform3f(u.uU, ...U); gl.uniform3f(u.uF, ...F);
   gl.uniform1f(u.uT, T); gl.uniform1f(u.uEyeH, EYE_HEIGHT);
   gl.uniform1i(u.uMode, cam ? 1 : 0); gl.uniform1f(u.uCamOk, camOk);
+  gl.uniform1i(u.uScene, Math.max(0, PLACES.indexOf(S.place)));
+  gl.uniform1f(u.uMe, S.me && !cam ? 1 : 0); gl.uniform1f(u.uMaskOk, maskOk);
+  gl.uniform2f(u.uSegTh, SEG_THRESHOLD[0], SEG_THRESHOLD[1]);
   const th = CAM_TAN_H / S.zoom, tv = th * (vid.videoHeight || 3) / (vid.videoWidth || 4);
   gl.uniform2f(u.uCamTan, th, tv);
   gl.uniform1i(u.uCam, 0); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, camTex);
+  gl.uniform1i(u.uMask, 1); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, maskTex);
+  gl.activeTexture(gl.TEXTURE0);
   gl.bindVertexArray(vaoFull); gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-  if (S.mode !== "cam") {
+  if (S.snow) {
     stepSnow(dt);
     gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(PS.p); const v = PS.u;
@@ -422,10 +635,23 @@ for (const c of CTL) {
 function showVals() {
   for (const c of CTL) {
     document.querySelector("#row-" + c.id + " .val").textContent = c.fmt(S[c.id]);
-    document.getElementById("row-" + c.id).style.display = c.cam && S.mode === "scene" ? "none" : "";
+    document.getElementById("row-" + c.id).style.display = c.cam && !needsCam() ? "none" : "";
   }
-  for (const b of document.querySelectorAll("#modes div")) b.classList.toggle("on", b.dataset.m === S.mode);
+  for (const b of document.querySelectorAll("#modes div")) b.classList.toggle("on", b.dataset.m === S.place);
+  for (const b of document.querySelectorAll("#togs div")) {
+    b.classList.toggle("on", !!S[b.dataset.t]);
+    if (b.dataset.t === "me") b.style.display = S.place === "cam" ? "none" : "";
+  }
   drawGuide();
+}
+function needsCam() { return S.place === "cam" || S.me; }
+// start or stop the camera (and the cutout) to match the settings
+async function syncCam() {
+  document.getElementById("note").textContent = "";
+  if (!needsCam()) { stopCam(); return true; }
+  const ok = await startCam();
+  if (ok && S.me && S.place !== "cam") loadSeg();
+  return ok;
 }
 
 /* yellow crosses on each lens centre while the panel is open, so the spacing can be judged without the goggles */
@@ -450,12 +676,17 @@ function drawGuide() {
   gctx.beginPath(); gctx.moveTo(innerWidth / 2, 0); gctx.lineTo(innerWidth / 2, innerHeight); gctx.stroke();
 }
 addEventListener("resize", drawGuide);
-for (const b of document.querySelectorAll("#modes div")) b.addEventListener("click", async () => {
-  S.mode = b.dataset.m; save(); showVals();
-  document.getElementById("note").textContent = "";
-  if (S.mode === "scene") stopCam(); else await startCam();
+for (const b of document.querySelectorAll("#modes div")) b.addEventListener("click", () => {
+  S.place = b.dataset.m; save(); showVals(); syncCam();
 });
-document.getElementById("reset").addEventListener("click", () => { const m = S.mode; S = Object.assign({}, DEFAULTS, { mode: m }); showVals(); save(); });
+for (const b of document.querySelectorAll("#togs div")) b.addEventListener("click", () => {
+  S[b.dataset.t] = !S[b.dataset.t]; save(); showVals(); syncCam();
+});
+// "元に戻す" puts back only the lens and camera-size numbers; the place and switches stay
+document.getElementById("reset").addEventListener("click", () => {
+  for (const c of CTL) S[c.id] = DEFAULTS[c.id];
+  showVals(); save();
+});
 showVals();
 
 let wake = null;
@@ -473,7 +704,7 @@ document.getElementById("go").addEventListener("click", async () => {
     } catch (e) {}
     addEventListener("deviceorientation", onOrient);
     keepAwake();
-    if (S.mode !== "scene" && !(await startCam())) return;
+    if (needsCam() && !(await syncCam())) return;
     window.started = true;
     document.getElementById("go").textContent = "つづける";
     setTimeout(doRecenter, 400);
