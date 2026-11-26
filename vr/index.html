@@ -59,7 +59,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.10";
+const VERSION = "2026-11-26.11";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -137,30 +137,44 @@ function qRot(q, x, y, z) {
   return [ix*qw + iw*-qx + iy*-qz - iz*-qy, iy*qw + iw*-qy + iz*-qx - ix*-qz, iz*qw + iw*-qz + ix*-qy - iy*-qx];
 }
 
-/* ---------- the stage: turned sideways when the page is portrait (portrait lock on) but the phone sits
-   landscape in the goggles. Then iOS can never flip the picture while you look around. ---------- */
-let ROT = 0, lastGamma = 0;                // 0, 90 or -90: how the stage is turned
-function VW() { return ROT ? innerHeight : innerWidth; }   // the stage's own width / height
-function VH() { return ROT ? innerWidth : innerHeight; }
+/* ---------- the stage: the picture always stays the way the phone physically sits in the goggles.
+   PHYS = how the phone sits (90: its top to the left, -90: top to the right), fixed when you press start.
+   Whatever iOS does with the screen (portrait, landscape, upside-down landscape), the stage is turned by
+   the difference, so a flip by iOS changes nothing you see. With the portrait lock on, iOS never flips. */
+let ROT = 0, PHYS = 0, lastGamma = 0;
+function screenAng() {
+  let a = (screen.orientation && typeof screen.orientation.angle === "number") ? screen.orientation.angle : (window.orientation || 0);
+  a = ((a % 360) + 360) % 360; return a > 180 ? a - 360 : a;      // 0, 90, -90 or 180
+}
+function VW() { return Math.abs(ROT) === 90 ? innerHeight : innerWidth; }   // the stage's own width / height
+function VH() { return Math.abs(ROT) === 90 ? innerWidth : innerHeight; }
 function applyStage() {
-  const port = window.started && innerHeight > innerWidth;
-  // which way round the phone sits: gamma is about -90 with its top to the left, +90 with its top to the right
-  if (port && !ROT) ROT = lastGamma < 0 ? 90 : -90;
-  if (!port) ROT = 0;
+  if (!window.started) { ROT = 0; }
+  else {
+    if (!PHYS) {
+      const sa = screenAng();
+      // landscape now: iOS already knows. Portrait (lock on): ask the tilt sensor (gamma about -90 = top to the left)
+      PHYS = Math.abs(sa) === 90 ? sa : (lastGamma < 0 ? 90 : -90);
+    }
+    let r = PHYS - screenAng(); r = ((r % 360) + 360) % 360; ROT = r > 180 ? r - 360 : r;
+  }
   const st = document.getElementById("stage").style;
   if (ROT) {
-    st.width = innerHeight + "px"; st.height = innerWidth + "px";
-    st.left = (innerWidth - innerHeight) / 2 + "px"; st.top = (innerHeight - innerWidth) / 2 + "px";
+    st.width = VW() + "px"; st.height = VH() + "px";
+    st.left = (innerWidth - VW()) / 2 + "px"; st.top = (innerHeight - VH()) / 2 + "px";
     st.transform = "rotate(" + ROT + "deg)";
   } else { st.width = ""; st.height = ""; st.left = "0"; st.top = "0"; st.transform = ""; }
   resize(); drawGuide();
 }
-// a touch point in stage coordinates
+// a touch point in stage coordinates (undo the stage's turn)
 function toStage(e) {
-  if (!ROT) return { x: e.clientX, y: e.clientY };
-  const cx = innerWidth / 2, cy = innerHeight / 2, dx = e.clientX - cx, dy = e.clientY - cy;
-  return ROT > 0 ? { x: VW() / 2 + dy, y: VH() / 2 - dx } : { x: VW() / 2 - dy, y: VH() / 2 + dx };
+  const dx = e.clientX - innerWidth / 2, dy = e.clientY - innerHeight / 2;
+  if (ROT === 90) return { x: VW() / 2 + dy, y: VH() / 2 - dx };
+  if (ROT === -90) return { x: VW() / 2 - dy, y: VH() / 2 + dx };
+  if (ROT === 180) return { x: VW() / 2 - dx, y: VH() / 2 - dy };
+  return { x: e.clientX, y: e.clientY };
 }
+if (screen.orientation) screen.orientation.addEventListener("change", () => setTimeout(applyStage, 50));
 
 /* ---------- head orientation ---------- */
 let devQ = null, hasGyro = false;
@@ -175,7 +189,7 @@ function onOrient(e) {
   let q = [s1*c2*c3 + c1*s2*s3, c1*s2*c3 - s1*c2*s3, c1*c2*s3 - s1*s2*c3, c1*c2*c3 + s1*s2*s3];   // Euler YXZ
   q = qMul(q, Q_BACK);
   lastGamma = e.gamma;
-  const ang = (ROT || (screen.orientation && screen.orientation.angle) || window.orientation || 0) * d;
+  const ang = (window.started && PHYS ? PHYS : screenAng()) * d;   // the phone's real way round, not the screen's
   devQ = qMul(q, qAxis(0, 0, 1, -ang));
 }
 function headQ() {
@@ -183,7 +197,7 @@ function headQ() {
   return qMul(qAxis(0, 1, 0, dragYaw), qAxis(1, 0, 0, dragPitch));
 }
 function doRecenter() {
-  if (ROT) { ROT = 0; applyStage(); }   // look again at which way round the phone sits
+  if (window.started) { PHYS = 0; applyStage(); }   // look again at which way round the phone sits
   if (!devQ) { dragYaw = 0; dragPitch = 0; return; }
   const f = qRot(devQ, 0, 0, -1);
   recenter = qAxis(0, 1, 0, -Math.atan2(-f[0], -f[2]));
