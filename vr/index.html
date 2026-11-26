@@ -44,7 +44,7 @@
   <div class="modes" id="modes"><div data-m="river">夜の川辺</div><div data-m="sunset">夕焼けの海</div><div data-m="meadow">昼の草原</div><div data-m="space">宇宙</div><div data-m="cam">カメラ</div><div data-m="scan">部屋スキャン</div></div>
   <div class="modes" id="togs"><div data-t="snow">雪</div><div data-t="me">自分を映す</div></div>
   <div id="ctl"></div>
-  <div class="s" id="scanhelp" style="display:none">部屋スキャン：見ている方向を AI がずっと調べ続け、部屋の地図を作っていきます。画面の中央の上を押すと「線画の世界」に切り替わり、もう一度押すとカメラに戻ります。線の色：<span style="color:#6fa2ff">壁</span>・<span style="color:#4fd27e">床</span>・<span style="color:#ffd84a">天井</span>・<span style="color:#ff9a3c">窓とドア</span>・<span style="color:#ff5c7c">人</span>・ほかの物。<span id="scanclear" style="text-decoration:underline">地図を消す</span></div>
+  <div class="s" id="scanhelp" style="display:none">部屋スキャン：画面の中央の上を押すと「線画」（カメラに写る物の輪郭を白、ほかを黒）に切り替わり、もう一度押すとカメラに戻ります。<span id="scanclear" style="display:none"></span></div>
   <div class="btns"><div id="reset">元に戻す</div><div id="go">はじめる</div></div>
   <div class="s" id="note"></div>
   <div class="s" id="ver" style="text-align:right;margin:0"></div>
@@ -53,7 +53,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.6";
+const VERSION = "2026-11-26.7";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -89,6 +89,11 @@ const PLACES = ["river", "sunset", "meadow", "space", "cam", "scan"];
 const TF_VER = "3.0.2";
 const SCAN_MODEL = "Xenova/segformer-b0-finetuned-ade-512-512";
 const SCAN_W = 448;          // the camera picture is shrunk to this width before the AI looks at it
+// the line world (black and white): edges of the camera picture drawn white on black
+const LINE_WIDTH = 1.5;      // how far apart (camera pixels) the edge filter looks: bigger = thicker, calmer lines
+const LINE_LO = 0.05;        // edges weaker than this stay black (raise it if the walls look grainy)
+const LINE_HI = 0.16;        // edges stronger than this are fully white
+const SCAN_AI = false;       // the colour-labelling AI (walls/floor/ceiling); off: the black-and-white lines don't need it
 const SCAN_ON_GPU = false;   // true = faster scans, but the view hitches while the AI uses the GPU
 const SCAN_MIN_REGION = 0.004;   // patches smaller than this share of the picture are treated as noise
 const SCAN_CONF_MAX = 6;      // how many disagreeing scans it takes to change a direction's label
@@ -168,7 +173,7 @@ uniform vec3 uR, uU, uF, uPos;
 uniform int uMode, uScene;
 uniform sampler2D uCam, uMask;
 uniform sampler2D uWorld, uPal;
-uniform float uLines, uFloorId, uCeilId, uEdge, uCeilH;
+uniform float uLines, uFloorId, uCeilId, uEdge, uCeilH, uLineW, uLineLo, uLineHi;
 uniform vec2 uCamTexel;
 out vec4 o;
 const float PI = 3.14159265, DEG = PI / 180.0;
@@ -181,31 +186,18 @@ float worldId(vec3 d) {
 vec3 palCol(float id) { return texture(uPal, vec2((id + 0.5) / 256.0, 0.5)).rgb; }
 float lum(vec2 uv) { return dot(texture(uCam, uv).rgb, vec3(0.299, 0.587, 0.114)); }
 
-// the line world: dark space, borders between things drawn in their colours, a grid on floor and ceiling,
-// and faint lines where the camera picture itself has edges
+// the line world: black and white only. Where the live camera picture has an edge (a change in
+// brightness), draw white; everything else is black. (Sobel filter on the camera picture.)
 vec3 lineWorld(vec3 d, vec2 uv, bool camIn) {
-  vec3 col = vec3(0.016, 0.027, 0.055);
-  float id = worldId(d);
-  vec3 pc = id > 0.0 ? palCol(id) : vec3(0.3);
-  // borders: does a nearby direction belong to something else? (directions not scanned yet don't count,
-  // so the edge of what has been seen is not drawn as a line)
-  float a = worldId(normalize(d + uR * uEdge)), b = worldId(normalize(d - uR * uEdge));
-  float c = worldId(normalize(d + uU * uEdge)), e = worldId(normalize(d - uU * uEdge));
-  bool edge = (a > 0.0 && a != id) || (b > 0.0 && b != id) || (c > 0.0 && c != id) || (e > 0.0 && e != id);
-  if (id > 0.0 && edge) col = pc;
-  // floor / ceiling grids every 50 cm
-  if (id == uFloorId && d.y < -0.02) {
-    vec2 p = d.xz * (uEyeH / -d.y) * 2.0, f = abs(fract(p) - 0.5);
-    float g = smoothstep(0.47, 0.5, max(f.x, f.y));
-    col = mix(col, pc * 0.8, g * clamp(3.0 * -d.y, 0.0, 1.0));
-  }
-  if (id == uCeilId && d.y > 0.02) {
-    vec2 p = d.xz * (uCeilH / d.y) * 2.0, f = abs(fract(p) - 0.5);
-    float g = smoothstep(0.47, 0.5, max(f.x, f.y));
-    col = mix(col, pc * 0.8, g * clamp(3.0 * d.y, 0.0, 1.0));
-  }
-  // (the live camera's own edges were drawn here once; they flickered and cluttered the view, so they are gone)
-  return col;
+  if (!camIn) return vec3(0);
+  vec2 t = uCamTexel * uLineW;
+  float tl = lum(uv + vec2(-t.x, -t.y)), tc = lum(uv + vec2(0, -t.y)), tr = lum(uv + vec2(t.x, -t.y));
+  float ml = lum(uv + vec2(-t.x, 0)),                                   mr = lum(uv + vec2(t.x, 0));
+  float bl = lum(uv + vec2(-t.x, t.y)),  bc = lum(uv + vec2(0, t.y)),  br = lum(uv + vec2(t.x, t.y));
+  float gx = (tr + 2.0 * mr + br) - (tl + 2.0 * ml + bl);
+  float gy = (bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr);
+  float m = length(vec2(gx, gy)) * 0.25;
+  return vec3(smoothstep(uLineLo, uLineHi, m));
 }
 
 float h3(vec3 p) {
@@ -763,9 +755,9 @@ let scanResolve = null, scanShot = null, scanCount = 0, scanErr = "", hudUntil =
 // a small status line inside the goggles (both eyes), shown for a while after a change
 function hud(show) {
   if (show) hudUntil = performance.now() + 2500;
-  const on = S.place === "scan" && window.started && (performance.now() < hudUntil || !scannerReady || scanErr);
-  const txt = (lineMode ? "線画 ON" : "カメラ") + "　" +
-    (scanErr ? "AI エラー" : scannerReady ? "スキャン " + scanCount + " 回" : "AI 読み込み中…");
+  const on = S.place === "scan" && window.started && (performance.now() < hudUntil || (SCAN_AI && (!scannerReady || scanErr)));
+  const txt = (lineMode ? "線画 ON" : "カメラ") + (!SCAN_AI ? "" : "　" +
+    (scanErr ? "AI エラー" : scannerReady ? "スキャン " + scanCount + " 回" : "AI 読み込み中…"));
   [["hudL", -1], ["hudR", 1]].forEach(([id, side]) => {
     const el = document.getElementById(id);
     el.textContent = txt; el.style.display = on ? "" : "none";
@@ -944,6 +936,7 @@ function frame(now) {
   gl.uniform1i(u.uCam, 0); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, camTex);
   gl.uniform1i(u.uMask, 1); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, maskTex);
   gl.uniform1f(u.uEdge, EDGE_ANGLE); gl.uniform1f(u.uCeilH, CEIL_H);
+  gl.uniform1f(u.uLineW, LINE_WIDTH); gl.uniform1f(u.uLineLo, LINE_LO); gl.uniform1f(u.uLineHi, LINE_HI);
   setScanUniforms(u);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindVertexArray(vaoFull); gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -1013,7 +1006,7 @@ async function syncCam() {
   if (!needsCam()) { stopCam(); return true; }
   const ok = await startCam();
   if (ok && S.me && S.place !== "cam" && S.place !== "scan") loadSeg();
-  if (ok && S.place === "scan") { loadScanner(); if (window.started) scanLoop(); }
+  if (ok && S.place === "scan" && SCAN_AI) { loadScanner(); if (window.started) scanLoop(); }
   return ok;
 }
 
@@ -1072,7 +1065,7 @@ document.getElementById("go").addEventListener("click", async () => {
     if (needsCam() && !(await syncCam())) return;
     window.started = true;
     document.getElementById("go").textContent = "つづける";
-    if (S.place === "scan") scanLoop();
+    if (S.place === "scan" && SCAN_AI) scanLoop();
     setTimeout(doRecenter, 400);
   }
   panel.classList.add("off");
