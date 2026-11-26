@@ -64,7 +64,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.19";
+const VERSION = "2026-11-26.20";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -127,8 +127,43 @@ let cameraZoomed = false;
 let camHwZoom = 1;                  // what the phone's own lens is actually set to
 // how big the picture should look in total: ×5 while the quick zoom is on, else the panel's "カメラの大きさ"
 function cameraZoomValue() { return cameraZoomed ? QUICK_CAMERA_ZOOM : S.zoom; }
-// the part the shader does by cropping; the lens does the rest (a lens ×5 stays sharp, a crop does not)
-function camDigitalFactor() { return cameraZoomValue() / (camHwZoom > 1 ? camHwZoom : 1); }
+// how much the picture is magnified without the lens (bigger = closer). The lens's own zoom is already in the
+// picture it sends, so what the lens did is taken back out; a missing lens zoom is made up by cropping instead.
+function camMag() { return (cameraZoomed ? QUICK_CAMERA_ZOOM / (camHwZoom > 1 ? camHwZoom : 1) : 1) / S.zoom; }
+// the half-tangents the camera picture is drawn with (x along the picture, y across it). While the lens is zoomed,
+// the picture is stretched over the whole lenses so no black is left above and below it (its sides are cut instead).
+const viewTan = { key: "", x: 0, y: 0 };
+function viewTanExtent() {
+  const key = [mmW, mmH, S.sep, S.vy, S.dist, S.k].join(",");
+  if (viewTan.key === key) return viewTan;
+  const k1 = K1 * S.k, k2 = K2 * S.k;
+  let mx = 0, my = 0;
+  for (let i = 0; i <= 16; i++) for (let j = 0; j <= 10; j++) {
+    const xm = mmW * i / 16, ym = mmH * j / 10;
+    for (const side of [-1, 1]) {
+      const lx = mmW * 0.5 + side * S.sep * 0.5, ly = mmH * 0.5 - S.vy;
+      const tsx = (xm - lx) / S.dist, tsy = (ly - ym) / S.dist, rs = Math.hypot(tsx, tsy);
+      let r = rs;
+      for (let n = 0; n < 8; n++) { const r2 = r * r; r -= (r * (1 + k1*r2 + k2*r2*r2) - rs) / (1 + 3*k1*r2 + 5*k2*r2*r2); }
+      if (!(r >= 0) || r > MAX_TAN) continue;   // the lens draws black out there
+      const f = rs > 0 ? r / rs : 1;
+      mx = Math.max(mx, Math.abs(tsx * f)); my = Math.max(my, Math.abs(tsy * f));
+    }
+  }
+  viewTan.key = key; viewTan.x = mx; viewTan.y = my;
+  return viewTan;
+}
+function camViewTan(vw, vh, camRot, cam) {
+  const tLong = (S.place === "pccam" ? PCCAM_TAN_H : CAM_TAN_H) * camMag();
+  let x = camRot ? tLong * vw / vh : tLong;      // half-view along the picture's long side
+  let y = camRot ? tLong : tLong * vh / vw;
+  if (cam && S.place !== "pccam" && cameraZoomed && camHwZoom > 1) {
+    const e = viewTanExtent(), needX = camRot ? e.y : e.x, needY = camRot ? e.x : e.y;
+    const c = Math.max(needX / x, needY / y);
+    if (c > 1) { x *= c; y *= c; }                // cover the lenses, keeping the picture's shape
+  }
+  return [x, y];
+}
 function camTrack() { return camOn && vid.srcObject ? vid.srcObject.getVideoTracks()[0] : null; }
 function camZoomMax() {
   const t = camTrack(), z = t && t.getCapabilities ? t.getCapabilities().zoom : null;
@@ -935,7 +970,7 @@ async function scanOnce() {
   try {
     const q = headQ();
     const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
-    const th = CAM_TAN_H / camDigitalFactor(), tv = th * vid.videoHeight / vid.videoWidth;
+    const th = camTanNow[0], tv = camTanNow[1];
     const w = SCAN_W, h = Math.round(SCAN_W * vid.videoHeight / vid.videoWidth);
     // shrink on a canvas first: Safari does not always honour createImageBitmap's resize options
     if (!scanShot) scanShot = document.createElement("canvas");
@@ -1072,11 +1107,10 @@ function frame(now) {
   // the goggles' left-right, so it is read turned by the stage's turn. (The PC camera always comes landscape.)
   const vw = src.videoWidth || 4, vh = src.videoHeight || 3;
   const camRot = !pc && ROT && vh > vw ? ROT : 0;
-  const tLong = (pc ? PCCAM_TAN_H : CAM_TAN_H) / camDigitalFactor(); // half-view along the picture's long side; the lens may already be zoomed
-  if (camRot) gl.uniform2f(u.uCamTan, tLong * vw / vh, tLong);
-  else gl.uniform2f(u.uCamTan, tLong, tLong * vh / vw);
+  const [tanX, tanY] = camViewTan(vw, vh, camRot, cam);
+  gl.uniform2f(u.uCamTan, tanX, tanY);
   gl.uniform1i(u.uCamRot, camRot);
-  camRotNow = camRot; camTanNow = camRot ? [tLong * vw / vh, tLong] : [tLong, tLong * vh / vw];
+  camRotNow = camRot; camTanNow = [tanX, tanY];
   gl.uniform1i(u.uCam, 0); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, camTex);
   gl.uniform1i(u.uMask, 1); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, maskTex);
   gl.uniform1f(u.uEdge, EDGE_ANGLE); gl.uniform1f(u.uCeilH, CEIL_H);
