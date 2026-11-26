@@ -46,7 +46,7 @@
   <b>VR</b>
   <div class="s">黄色い十字が、それぞれのレンズの真ん中に来るように合わせてください（押し続けると連続で動きます）。<br>ゴーグルの中で：画面の<b style="font-size:12px">真ん中を押している間 → 向いている方へ歩く</b>／ほかを1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
   <div class="modes" id="modes"><div data-m="river">夜の川辺</div><div data-m="sunset">夕焼けの海</div><div data-m="meadow">昼の草原</div><div data-m="space">宇宙</div><div data-m="cam">カメラ</div><div data-m="scan">部屋スキャン</div><div data-m="pccam">PCカメラ</div></div>
-  <div class="modes" id="togs"><div data-t="snow">雪</div><div data-t="me">自分を映す</div></div>
+  <div class="modes" id="togs"><div data-t="snow">雪</div><div data-t="me">自分を映す</div><div data-t="flip">向きを反転</div></div>
   <div id="ctl"></div>
   <div class="s" id="pccamhelp" style="display:none">PCカメラ：PC で <b style="font-size:12px">kodair918-del.github.io/hub/pccam/</b> を開いて、番号 <b id="pccode" style="font-size:20px;color:#7fb4ff;letter-spacing:.15em"></b> を入れて「送る」を押すと、PC のカメラの映像が視界いっぱいに出ます。<span id="pcstate"></span></div>
   <div class="s" id="scanhelp" style="display:none">部屋スキャン：画面の真ん中を押すと「線画」（カメラに写る物の輪郭を白、ほかを黒）に切り替わり、もう一度押すとカメラに戻ります。<span id="scanclear" style="display:none"></span></div>
@@ -59,7 +59,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.11";
+const VERSION = "2026-11-26.12";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -89,7 +89,7 @@ const CAM_TAN_H = Math.tan(34 * Math.PI / 180);   // half of the 1x camera's hor
 // sep: lens spacing (mm), vy: lens centre up/down (mm), k: distortion scale, dist: screen-to-lens (mm),
 // zoom: camera picture size (1 = true size), place: river | sunset | meadow | space | cam,
 // snow: snowflakes on/off, me: cut the body out of the camera picture and put it in the place
-const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39, zoom: 1, place: "river", snow: true, me: false };
+const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39, zoom: 1, place: "river", snow: true, me: false, flip: false };
 const PLACES = ["river", "sunset", "meadow", "space", "cam", "scan", "pccam"];
 // PC camera: the PC's webcam comes in over WebRTC (PeerJS finds the PC; the video goes directly between the two)
 const PEER_PREFIX = "desxus-vr-";   // this page's id = prefix + a 4-digit number the PC page types in
@@ -137,27 +137,19 @@ function qRot(q, x, y, z) {
   return [ix*qw + iw*-qx + iy*-qz - iz*-qy, iy*qw + iw*-qy + iz*-qx - ix*-qz, iz*qw + iw*-qz + ix*-qy - iy*-qx];
 }
 
-/* ---------- the stage: the picture always stays the way the phone physically sits in the goggles.
-   PHYS = how the phone sits (90: its top to the left, -90: top to the right), fixed when you press start.
-   Whatever iOS does with the screen (portrait, landscape, upside-down landscape), the stage is turned by
-   the difference, so a flip by iOS changes nothing you see. With the portrait lock on, iOS never flips. */
-let ROT = 0, PHYS = 0, lastGamma = 0;
+/* ---------- the stage: made for the iPhone's portrait lock. The page is portrait, so everything is drawn
+   on a stage turned 90 degrees, and looks exactly like the landscape page. Always the same turn (no guessing):
+   phone's top to the left; "向きを反転" turns it the other way for a phone put in the other way round.
+   If the page is landscape (lock off), nothing is turned. ---------- */
+let ROT = 0;
 function screenAng() {
   let a = (screen.orientation && typeof screen.orientation.angle === "number") ? screen.orientation.angle : (window.orientation || 0);
-  a = ((a % 360) + 360) % 360; return a > 180 ? a - 360 : a;      // 0, 90, -90 or 180
+  a = ((a % 360) + 360) % 360; return a > 180 ? a - 360 : a;
 }
-function VW() { return Math.abs(ROT) === 90 ? innerHeight : innerWidth; }   // the stage's own width / height
-function VH() { return Math.abs(ROT) === 90 ? innerWidth : innerHeight; }
+function VW() { return ROT ? innerHeight : innerWidth; }   // the stage's own width / height
+function VH() { return ROT ? innerWidth : innerHeight; }
 function applyStage() {
-  if (!window.started) { ROT = 0; }
-  else {
-    if (!PHYS) {
-      const sa = screenAng();
-      // landscape now: iOS already knows. Portrait (lock on): ask the tilt sensor (gamma about -90 = top to the left)
-      PHYS = Math.abs(sa) === 90 ? sa : (lastGamma < 0 ? 90 : -90);
-    }
-    let r = PHYS - screenAng(); r = ((r % 360) + 360) % 360; ROT = r > 180 ? r - 360 : r;
-  }
+  ROT = innerHeight > innerWidth ? (S.flip ? -90 : 90) : 0;
   const st = document.getElementById("stage").style;
   if (ROT) {
     st.width = VW() + "px"; st.height = VH() + "px";
@@ -171,10 +163,8 @@ function toStage(e) {
   const dx = e.clientX - innerWidth / 2, dy = e.clientY - innerHeight / 2;
   if (ROT === 90) return { x: VW() / 2 + dy, y: VH() / 2 - dx };
   if (ROT === -90) return { x: VW() / 2 - dy, y: VH() / 2 + dx };
-  if (ROT === 180) return { x: VW() / 2 - dx, y: VH() / 2 - dy };
   return { x: e.clientX, y: e.clientY };
 }
-if (screen.orientation) screen.orientation.addEventListener("change", () => setTimeout(applyStage, 50));
 
 /* ---------- head orientation ---------- */
 let devQ = null, hasGyro = false;
@@ -188,8 +178,7 @@ function onOrient(e) {
   const c1 = Math.cos(x/2), c2 = Math.cos(y/2), c3 = Math.cos(z/2), s1 = Math.sin(x/2), s2 = Math.sin(y/2), s3 = Math.sin(z/2);
   let q = [s1*c2*c3 + c1*s2*s3, c1*s2*c3 - s1*c2*s3, c1*c2*s3 - s1*s2*c3, c1*c2*c3 + s1*s2*s3];   // Euler YXZ
   q = qMul(q, Q_BACK);
-  lastGamma = e.gamma;
-  const ang = (window.started && PHYS ? PHYS : screenAng()) * d;   // the phone's real way round, not the screen's
+  const ang = (ROT || screenAng()) * d;   // with the stage turned, the phone sits the stage's way round
   devQ = qMul(q, qAxis(0, 0, 1, -ang));
 }
 function headQ() {
@@ -197,7 +186,6 @@ function headQ() {
   return qMul(qAxis(0, 1, 0, dragYaw), qAxis(1, 0, 0, dragPitch));
 }
 function doRecenter() {
-  if (window.started) { PHYS = 0; applyStage(); }   // look again at which way round the phone sits
   if (!devQ) { dragYaw = 0; dragPitch = 0; return; }
   const f = qRot(devQ, 0, 0, -1);
   recenter = qAxis(0, 1, 0, -Math.atan2(-f[0], -f[2]));
@@ -1134,7 +1122,7 @@ for (const b of document.querySelectorAll("#modes div")) b.addEventListener("cli
 });
 document.getElementById("scanclear").addEventListener("click", () => { clearScans(); document.getElementById("note").textContent = "部屋の地図を消しました。"; });
 for (const b of document.querySelectorAll("#togs div")) b.addEventListener("click", () => {
-  S[b.dataset.t] = !S[b.dataset.t]; save(); showVals(); syncCam();
+  S[b.dataset.t] = !S[b.dataset.t]; save(); showVals(); syncCam(); applyStage();
 });
 // "元に戻す" puts back only the lens and camera-size numbers; the place and switches stay
 document.getElementById("reset").addEventListener("click", () => {
@@ -1142,6 +1130,7 @@ document.getElementById("reset").addEventListener("click", () => {
   showVals(); save();
 });
 showVals();
+applyStage();
 
 let wake = null;
 window.started = false;
@@ -1160,7 +1149,6 @@ document.getElementById("go").addEventListener("click", async () => {
     keepAwake();
     if (needsCam() && !(await syncCam())) return;
     window.started = true;
-    applyStage();
     document.getElementById("go").textContent = "つづける";
     if (S.place === "scan" && SCAN_AI) scanLoop();
     setTimeout(doRecenter, 400);
