@@ -19,6 +19,7 @@
   .row .pm { height:44px; border-radius:12px; background:#2c303b; display:flex; align-items:center; justify-content:center; font-size:24px; font-weight:bold; touch-action:manipulation; }
   .row .pm:active { background:#7fb4ff; color:#0b0b0a; }
   .row .val { text-align:center; font-variant-numeric:tabular-nums; font-size:15px; }
+  .hud { position:fixed; top:22%; transform:translateX(-50%); z-index:3; pointer-events:none; padding:4px 10px; border-radius:8px; background:rgba(0,0,0,.6); color:#bfefff; font:bold 13px system-ui, sans-serif; white-space:nowrap; }
   #guide { position:fixed; inset:0; width:100vw; height:100vh; height:100dvh; pointer-events:none; z-index:5; }
   .btns { display:flex; gap:8px; margin-top:10px; }
   .btns div { flex:1; text-align:center; padding:11px 0; border-radius:12px; font-weight:bold; font-size:15px; }
@@ -35,6 +36,7 @@
 <body>
 <canvas id="c"></canvas>
 <canvas id="guide"></canvas>
+<div class="hud" id="hudL" style="display:none"></div><div class="hud" id="hudR" style="display:none"></div>
 <video id="vid" playsinline muted autoplay></video>
 <div id="panel">
   <b>VR</b>
@@ -51,7 +53,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.4";
+const VERSION = "2026-11-26.5";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -692,11 +694,26 @@ gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, palette);
 
-let scanResolve = null;
+let scanResolve = null, scanShot = null, scanCount = 0, scanErr = "", hudUntil = 0;
+// a small status line inside the goggles (both eyes), shown for a while after a change
+function hud(show) {
+  if (show) hudUntil = performance.now() + 2500;
+  const on = S.place === "scan" && window.started && (performance.now() < hudUntil || !scannerReady || scanErr);
+  const txt = (lineMode ? "線画 ON" : "カメラ") + "　" +
+    (scanErr ? "AI エラー" : scannerReady ? "スキャン " + scanCount + " 回" : "AI 読み込み中…");
+  [["hudL", -1], ["hudR", 1]].forEach(([id, side]) => {
+    const el = document.getElementById(id);
+    el.textContent = txt; el.style.display = on ? "" : "none";
+    el.style.left = (innerWidth / 2 + side * S.sep / 2 * PX_PER_MM) + "px";   // above each lens centre
+  });
+}
+setInterval(() => hud(false), 300);
 function onScanMessage(ev) {
   const m = ev.data, note = document.getElementById("note");
+  if (m.type === "scanned") scanCount++;
+  if (m.type === "error") scanErr = m.msg;
   if (m.type === "ready") {
-    scannerReady = true;
+    scannerReady = true; hud(true);
     note.textContent = "スキャン中：見回すと部屋の地図ができていきます。中央の上を押すと線画の世界に切り替わります。";
   } else if (m.type === "error") {
     note.textContent = "部屋を調べる AI でエラー（" + m.msg + "）";
@@ -721,7 +738,7 @@ function loadScanner() {
   const url = URL.createObjectURL(new Blob([SCAN_WORKER], { type: "text/javascript" }));
   scanWorker = new Worker(url, { type: "module" });
   scanWorker.onmessage = onScanMessage;
-  scanWorker.onerror = e => { document.getElementById("note").textContent = "部屋を調べる AI を動かせませんでした（" + (e.message || "worker") + "）"; };
+  scanWorker.onerror = e => { scanErr = e.message || "worker"; document.getElementById("note").textContent = "部屋を調べる AI を動かせませんでした（" + scanErr + "）"; };
   scanWorker.postMessage({ type: "init", tfVer: TF_VER, model: SCAN_MODEL, W: WORLD_W, H: WORLD_H, gpu: SCAN_ON_GPU });
 }
 // one scan: the frame and the head's direction go to the worker; the page keeps drawing meanwhile
@@ -733,10 +750,15 @@ async function scanOnce() {
     const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
     const th = CAM_TAN_H / S.zoom, tv = th * vid.videoHeight / vid.videoWidth;
     const w = SCAN_W, h = Math.round(SCAN_W * vid.videoHeight / vid.videoWidth);
-    const bitmap = await createImageBitmap(vid, { resizeWidth: w, resizeHeight: h });
+    // shrink on a canvas first: Safari does not always honour createImageBitmap's resize options
+    if (!scanShot) scanShot = document.createElement("canvas");
+    scanShot.width = w; scanShot.height = h;
+    scanShot.getContext("2d").drawImage(vid, 0, 0, w, h);
+    const bitmap = await createImageBitmap(scanShot);
     await new Promise(res => { scanResolve = res; scanWorker.postMessage({ type: "scan", bitmap, w, h, R, U, F, th, tv }, [bitmap]); });
   } catch (e) {
-    document.getElementById("note").textContent = "スキャンできませんでした（" + (e.message || e) + "）";
+    scanErr = String(e.message || e);
+    document.getElementById("note").textContent = "スキャンできませんでした（" + scanErr + "）";
   } finally { scanBusy = false; }
 }
 // keep scanning while the room scan is on screen
@@ -998,7 +1020,7 @@ let drag = null, tapTimer = 0, lastTap = 0;
 const walkers = new Set();
 cv.addEventListener("pointerdown", e => {
   if (window.started && inWalkZone(e.clientX, e.clientY)) {
-    if (S.place === "scan") { lineMode = !lineMode; return; }   // in the room scan, the same spot switches the line world
+    if (S.place === "scan") { lineMode = !lineMode; hud(true); return; }   // in the room scan, the same spot switches the line world
     walkers.add(e.pointerId); walking = walkers.size; return;
   }
   drag = { x: e.clientX, y: e.clientY, yaw: dragYaw, pitch: dragPitch, moved: false };
