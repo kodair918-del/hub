@@ -51,7 +51,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.3";
+const VERSION = "2026-11-26.4";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -87,6 +87,7 @@ const PLACES = ["river", "sunset", "meadow", "space", "cam", "scan"];
 const TF_VER = "3.0.2";
 const SCAN_MODEL = "Xenova/segformer-b0-finetuned-ade-512-512";
 const SCAN_W = 448;          // the camera picture is shrunk to this width before the AI looks at it
+const SCAN_ON_GPU = false;   // true = faster scans, but the view hitches while the AI uses the GPU
 const SCAN_GAP_MS = 250;     // pause between scans (scanning never stops while the room scan is open)
 const WORLD_W = 2048, WORLD_H = 1024;   // the room map: one label per direction (0.18 deg per map pixel)
 const EDGE_ANGLE = 0.006;    // how far apart (radians) two directions must disagree to draw a line there
@@ -595,8 +596,9 @@ self.onmessage = async ev => {
     if (m.type === "init") {
       W = m.W; H = m.H; world = new Uint8Array(W * H); conf = new Uint8Array(W * H);
       tf = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@" + m.tfVer);
-      if (self.navigator && self.navigator.gpu) { try { seg = await tf.pipeline("image-segmentation", m.model, { device: "webgpu" }); } catch (e) { seg = null; } }
-      if (!seg) seg = await tf.pipeline("image-segmentation", m.model);
+      // on the CPU on purpose: on the GPU the AI's big jobs held up the drawing and the view hitched
+      if (m.gpu && self.navigator && self.navigator.gpu) { try { seg = await tf.pipeline("image-segmentation", m.model, { device: "webgpu" }); } catch (e) { seg = null; } }
+      if (!seg) seg = await tf.pipeline("image-segmentation", m.model, { device: "wasm" });
       self.postMessage({ type: "ready" });
       return;
     }
@@ -720,7 +722,7 @@ function loadScanner() {
   scanWorker = new Worker(url, { type: "module" });
   scanWorker.onmessage = onScanMessage;
   scanWorker.onerror = e => { document.getElementById("note").textContent = "部屋を調べる AI を動かせませんでした（" + (e.message || "worker") + "）"; };
-  scanWorker.postMessage({ type: "init", tfVer: TF_VER, model: SCAN_MODEL, W: WORLD_W, H: WORLD_H });
+  scanWorker.postMessage({ type: "init", tfVer: TF_VER, model: SCAN_MODEL, W: WORLD_W, H: WORLD_H, gpu: SCAN_ON_GPU });
 }
 // one scan: the frame and the head's direction go to the worker; the page keeps drawing meanwhile
 async function scanOnce() {
