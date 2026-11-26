@@ -49,7 +49,12 @@
   <div class="modes" id="togs"><div data-t="snow">雪</div><div data-t="me">自分を映す</div><div data-t="flip">向きを反転</div></div>
   <div id="ctl"></div>
   <div class="s" id="pccamhelp" style="display:none">PCカメラ：PC で <b style="font-size:12px">kodair918-del.github.io/hub/pccam/</b> を開いて、番号 <b id="pccode" style="font-size:20px;color:#7fb4ff;letter-spacing:.15em"></b> を入れて「送る」を押すと、PC のカメラの映像が視界いっぱいに出ます。<span id="pcstate"></span></div>
-  <div class="s" id="scanhelp" style="display:none">部屋スキャン：画面の真ん中を押すと「線画」（カメラに写る物の輪郭を白、ほかを黒）に切り替わり、もう一度押すとカメラに戻ります。<span id="scanclear" style="display:none"></span></div>
+  <div class="s" id="scanhelp" style="display:none">部屋スキャン：画面の真ん中を押すと「線画」に切り替わり、もう一度押すとカメラに戻ります。「線を部屋に残す」なら、見回すほど部屋じゅうが線画になっていきます。<span id="scanclear" style="display:none"></span></div>
+  <div id="lineopts" style="display:none">
+    <div class="modes" id="lstyle"><div data-ls="simple">シンプル</div><div data-ls="neon">ネオン</div><div data-ls="sketch">手描き</div></div>
+    <div class="modes" id="lcol"><div data-lc="white">白</div><div data-lc="cyan">水色</div><div data-lc="green">緑</div><div data-lc="pink">ピンク</div></div>
+    <div class="modes"><div id="lkeep">線を部屋に残す</div><div id="lclear">残した線を消す</div></div>
+  </div>
   <div class="btns"><div id="reset">元に戻す</div><div id="go">はじめる</div></div>
   <div class="s" id="note"></div>
   <div class="s" id="ver" style="text-align:right;margin:0"></div>
@@ -59,7 +64,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.16";
+const VERSION = "2026-11-26.17";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -89,7 +94,7 @@ const CAM_TAN_H = Math.tan(34 * Math.PI / 180);   // half of the 1x camera's hor
 // sep: lens spacing (mm), vy: lens centre up/down (mm), k: distortion scale, dist: screen-to-lens (mm),
 // zoom: camera picture size (1 = true size), place: river | sunset | meadow | space | cam,
 // snow: snowflakes on/off, me: cut the body out of the camera picture and put it in the place
-const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39, zoom: 1, place: "river", snow: true, me: false, flip: false };
+const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39, zoom: 1, place: "river", snow: true, me: false, flip: false, lstyle: "simple", lcol: "white", lkeep: true };
 const PLACES = ["river", "sunset", "meadow", "space", "cam", "scan", "pccam", "hands"];
 // PC camera: the PC's webcam comes in over WebRTC (PeerJS finds the PC; the video goes directly between the two)
 const PEER_PREFIX = "desxus-vr-";   // this page's id = prefix + a 4-digit number the PC page types in
@@ -99,9 +104,9 @@ const TF_VER = "3.0.2";
 const SCAN_MODEL = "Xenova/segformer-b0-finetuned-ade-512-512";
 const SCAN_W = 448;          // the camera picture is shrunk to this width before the AI looks at it
 // the line world (black and white): edges of the camera picture drawn white on black
-const LINE_WIDTH = 1.5;      // how far apart (camera pixels) the edge filter looks: bigger = thicker, calmer lines
-const LINE_LO = 0.05;        // edges weaker than this stay black (raise it if the walls look grainy)
-const LINE_HI = 0.16;        // edges stronger than this are fully white
+const LINE_WIDTH = 1.0;      // how far apart (line-picture pixels) the edge filter looks: bigger = thicker, calmer lines
+const LINE_LO = 0.035;       // edges weaker than this are not lines (raise it if the walls look grainy)
+const LINE_HI = 0.11;        // edges stronger than this are full lines
 const SCAN_AI = false;       // the colour-labelling AI (walls/floor/ceiling); off: the black-and-white lines don't need it
 const SCAN_ON_GPU = false;   // true = faster scans, but the view hitches while the AI uses the GPU
 const SCAN_MIN_REGION = 0.004;   // patches smaller than this share of the picture are treated as noise
@@ -243,20 +248,6 @@ float worldId(vec3 d) {
 }
 vec3 palCol(float id) { return texture(uPal, vec2((id + 0.5) / 256.0, 0.5)).rgb; }
 float lum(vec2 uv) { return dot(texture(uCam, uv).rgb, vec3(0.299, 0.587, 0.114)); }
-
-// the line world: black and white only. Where the live camera picture has an edge (a change in
-// brightness), draw white; everything else is black. (Sobel filter on the camera picture.)
-vec3 lineWorld(vec3 d, vec2 uv, bool camIn) {
-  if (!camIn) return vec3(0);
-  vec2 t = uCamTexel * uLineW;
-  float tl = lum(uv + vec2(-t.x, -t.y)), tc = lum(uv + vec2(0, -t.y)), tr = lum(uv + vec2(t.x, -t.y));
-  float ml = lum(uv + vec2(-t.x, 0)),                                   mr = lum(uv + vec2(t.x, 0));
-  float bl = lum(uv + vec2(-t.x, t.y)),  bc = lum(uv + vec2(0, t.y)),  br = lum(uv + vec2(t.x, t.y));
-  float gx = (tr + 2.0 * mr + br) - (tl + 2.0 * ml + bl);
-  float gy = (bl + 2.0 * bc + br) - (tl + 2.0 * tc + tr);
-  float m = length(vec2(gx, gy)) * 0.25;
-  return vec3(smoothstep(uLineLo, uLineHi, m));
-}
 
 float h3(vec3 p) {
   uvec3 v = uvec3(ivec3(floor(p)) + 1000000);
@@ -456,6 +447,52 @@ vec3 skySpace(vec3 d) {
   }
   if (ringFront) c = mix(c, vec3(210, 190, 160) * (0.6 + 0.4 * sin(rr * 40.0)), 0.6);
   return c;
+}
+
+/* ---- the line world (room scan): simple / neon / sketch, live or kept on the room ---- */
+uniform sampler2D uEdgeTex, uWorldL;
+uniform int uLStyle;          // 0 simple, 1 neon, 2 sketch
+uniform vec3 uLCol;
+uniform float uLKeep;
+vec2 eqUV(vec3 d) { return vec2(atan(d.x, -d.z) / (2.0 * PI) + 0.5, acos(clamp(d.y, -1.0, 1.0)) / PI); }
+// what the line picture holds in direction d: x = line, y = brightness, z = seen at all
+vec3 lineAt(vec3 d) {
+  if (uLKeep > 0.5) return texture(uWorldL, eqUV(d)).rgb;
+  float cz = dot(d, uF);
+  if (cz < 0.05) return vec3(0);
+  vec2 uv = camUV(vec2(dot(d, uR), dot(d, uU)) / cz);
+  if (uCamOk < 0.5 || uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return vec3(0);
+  vec4 e = texture(uEdgeTex, uv);
+  return vec3(e.r, e.g, 1.0);
+}
+vec3 lineWorld(vec3 d, vec2 uv, bool camIn) {
+  vec3 c0 = lineAt(d);
+  if (uLStyle == 2) {
+    // sketch: graphite on paper. Lines wobble a little (looked up a hair to the side by a smooth noise),
+    // dark places get hatching, darker ones cross-hatching. The hatching follows the room, not the screen.
+    vec3 paper = vec3(0.94, 0.92, 0.87) - 0.035 * h3(floor(d * 900.0));
+    if (c0.z < 0.2) return paper * 0.96;
+    vec3 w = vec3(vn(d * 60.0 + 1.7), vn(d * 60.0 + 5.3), vn(d * 60.0 + 9.1)) - 0.5;
+    vec3 c = lineAt(normalize(d + w * 0.004));
+    float dark = 1.0 - c0.y;
+    float az = atan(d.x, -d.z), el = asin(clamp(d.y, -1.0, 1.0));
+    float h1 = step(0.55, dark) * (1.0 - smoothstep(0.03, 0.09, abs(fract((az + el) * 45.0) - 0.5)));
+    float h2 = step(0.72, dark) * (1.0 - smoothstep(0.03, 0.09, abs(fract((az - el) * 45.0) - 0.5)));
+    float ink = max(c.x, max(h1, h2) * 0.55);
+    return mix(paper, vec3(0.16, 0.15, 0.14), ink);
+  }
+  if (uLStyle == 1) {
+    // neon: a soft glow gathered from rings around this direction, and a bright core on the line itself
+    float g = 0.0;
+    for (int i = 0; i < 8; i++) {
+      float a = float(i) * 0.7854;
+      vec3 off = uR * cos(a) + uU * sin(a);
+      g += lineAt(normalize(d + off * 0.006)).x * 0.6 + lineAt(normalize(d + off * 0.014)).x * 0.3;
+    }
+    g /= 8.0;
+    return uLCol * g * 1.6 + mix(uLCol, vec3(1.0), 0.55) * c0.x;
+  }
+  return uLCol * c0.x;
 }
 
 void main() {
@@ -987,6 +1024,7 @@ function frame(now) {
     camOk = 1;
   }
   gl.disable(gl.BLEND);
+  if (S.place === "scan" && camOk && !pc) linePasses(now);
   gl.useProgram(P.p); const u = P.u;
   setLens(u);
   gl.uniform2f(u.uRes, cv.width, cv.height);
@@ -1011,6 +1049,7 @@ function frame(now) {
   gl.uniform1f(u.uEdge, EDGE_ANGLE); gl.uniform1f(u.uCeilH, CEIL_H);
   gl.uniform1f(u.uLineW, LINE_WIDTH); gl.uniform1f(u.uLineLo, LINE_LO); gl.uniform1f(u.uLineHi, LINE_HI);
   setScanUniforms(u);
+  setLineUniforms(u);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindVertexArray(vaoFull); gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -1239,6 +1278,165 @@ function drawAR(R, U, F, H) {
   gl.bindVertexArray(null);
 }
 
+/* ---------- the line picture, made on the GPU in three steps every frame ----------
+   1) GRAD: the camera picture, shrunk to EDGE_LONG on its long side, is blurred (5x5) and its brightness
+      change measured (Sobel): strength and direction.
+   2) THIN: a point stays a line only if it is the strongest across the line (non-maximum suppression),
+      so every line is one clean pixel wide; mixed a little with the last frame to calm the flicker.
+   3) KEEP: the lines are painted into a map of directions around the head (like a world map), for the
+      head as it was when the camera took the picture. Seen again, a place is repainted; unseen, it stays. */
+const EDGE_LONG = 640;        // line picture size on its long side (camera pixels are averaged into it)
+const LINE_KEEP_MIX = 0.35;   // how much each new look repaints the kept lines (1 = only the newest)
+const LINE_CALM = 0.6;        // how much each frame replaces the last in the live lines (lower = calmer)
+const LMAP_W = 4096, LMAP_H = 2048;   // the kept-lines map: 0.09 degrees per pixel
+const LINE_COLORS = { white: [1, 1, 1], cyan: [0.35, 0.95, 1], green: [0.45, 1, 0.55], pink: [1, 0.45, 0.8] };
+
+const FS_GRAD = `#version 300 es
+precision highp float;
+uniform sampler2D uCam; uniform vec2 uSize; uniform float uStep;
+out vec4 o;
+float L(vec2 uv) { return dot(texture(uCam, uv).rgb, vec3(0.299, 0.587, 0.114)); }
+void main() {
+  vec2 uv = gl_FragCoord.xy / uSize, s = uStep / uSize;
+  float v[25];
+  for (int j = 0; j < 5; j++) for (int i = 0; i < 5; i++) v[j * 5 + i] = L(uv + vec2(float(i - 2), float(j - 2)) * s);
+  float b[9];
+  for (int j = 0; j < 3; j++) for (int i = 0; i < 3; i++) {
+    int c = (j + 1) * 5 + (i + 1);
+    b[j * 3 + i] = (4.0 * v[c] + 2.0 * (v[c - 1] + v[c + 1] + v[c - 5] + v[c + 5]) + v[c - 6] + v[c - 4] + v[c + 4] + v[c + 6]) / 16.0;
+  }
+  float gx = (b[2] + 2.0 * b[5] + b[8]) - (b[0] + 2.0 * b[3] + b[6]);
+  float gy = (b[6] + 2.0 * b[7] + b[8]) - (b[0] + 2.0 * b[1] + b[2]);
+  float m = length(vec2(gx, gy));
+  vec2 n = m > 1e-5 ? vec2(gx, gy) / m : vec2(0);
+  o = vec4(m * 0.25, n * 0.5 + 0.5, b[4]);
+}`;
+const FS_THIN = `#version 300 es
+precision highp float;
+uniform sampler2D uGrad; uniform vec2 uSize; uniform float uLo, uHi, uCalm;
+out vec4 o;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uSize;
+  vec4 g = texture(uGrad, uv);
+  vec2 n = g.gb * 2.0 - 1.0;
+  vec2 st = vec2(sign(n.x) * step(0.38, abs(n.x)), sign(n.y) * step(0.38, abs(n.y))) / uSize;
+  float m1 = texture(uGrad, uv + st).r, m2 = texture(uGrad, uv - st).r;
+  float line = (g.r >= m1 && g.r >= m2) ? smoothstep(uLo, uHi, g.r) : 0.0;
+  o = vec4(line, g.a, 1.0, uCalm);
+}`;
+const FS_KEEP = `#version 300 es
+precision highp float;
+uniform sampler2D uEdgeTex; uniform vec2 uMap, uCamTan; uniform int uCamRot;
+uniform vec3 uR, uU, uF; uniform float uMix;
+out vec4 o;
+vec2 camUV(vec2 tu) {
+  if (uCamRot == 90) return vec2(0.5 + tu.y / (2.0 * uCamTan.x), 0.5 + tu.x / (2.0 * uCamTan.y));
+  if (uCamRot == -90) return vec2(0.5 - tu.y / (2.0 * uCamTan.x), 0.5 - tu.x / (2.0 * uCamTan.y));
+  return vec2(0.5 + tu.x / (2.0 * uCamTan.x), 0.5 - tu.y / (2.0 * uCamTan.y));
+}
+void main() {
+  vec2 f = gl_FragCoord.xy / uMap;
+  float az = (f.x - 0.5) * 6.2831853, phi = f.y * 3.1415927;
+  vec3 d = vec3(sin(phi) * sin(az), cos(phi), -sin(phi) * cos(az));
+  float cz = dot(d, uF);
+  if (cz < 0.05) discard;
+  vec2 uv = camUV(vec2(dot(d, uR), dot(d, uU)) / cz);
+  float e = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+  if (e <= 0.0) discard;
+  vec4 E = texture(uEdgeTex, uv);
+  o = vec4(E.r, E.g, 1.0, uMix * smoothstep(0.0, 0.04, e));
+}`;
+const PG = prog(VS_FULL, FS_GRAD), PT = prog(VS_FULL, FS_THIN), PK = prog(VS_FULL, FS_KEEP);
+function makeTarget(w, h, filter) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, w === LMAP_W ? gl.REPEAT : gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  return { tex, fb, w, h };
+}
+let gradT = null, edgeT = null, lmapT = null;
+function clearLines() {
+  if (!lmapT) return;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, lmapT.fb); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+// which rows / columns of the map this camera picture covers (so only that part is repainted)
+function footprint(R, U, F) {
+  const [cx, cy] = camRotNow ? [camTanNow[1], camTanNow[0]] : camTanNow;   // half-view across / up the goggles
+  const dirOf = (tx, ty) => { const d = [F[0] + R[0] * tx + U[0] * ty, F[1] + R[1] * tx + U[1] * ty, F[2] + R[2] * tx + U[2] * ty];
+    const l = Math.hypot(...d); return [d[0] / l, d[1] / l, d[2] / l]; };
+  let vmin = 1, vmax = 0; const us = [];
+  for (let k = 0; k <= 24; k++) {
+    const f = k / 24 * 2 - 1;
+    for (const [a, b] of [[f, -1], [f, 1], [-1, f], [1, f]]) {
+      const d = dirOf(a * cx, b * cy);
+      us.push(Math.atan2(d[0], -d[2]) / (2 * PI) + 0.5);
+      const v = Math.acos(Math.max(-1, Math.min(1, d[1]))) / PI; vmin = Math.min(vmin, v); vmax = Math.max(vmax, v);
+    }
+  }
+  const pole = s => { const cz = s * F[1]; if (cz <= 0.05) return false; return Math.abs(s * R[1] / cz) < cx && Math.abs(s * U[1] / cz) < cy; };
+  if (pole(1)) vmin = 0; if (pole(-1)) vmax = 1;
+  us.sort((a, b) => a - b);
+  let gapAt = 0, gap = us[0] + 1 - us[us.length - 1];
+  for (let i = 1; i < us.length; i++) if (us[i] - us[i - 1] > gap) { gap = us[i] - us[i - 1]; gapAt = i; }
+  const y0 = Math.max(0, Math.floor(vmin * LMAP_H) - 2), y1 = Math.min(LMAP_H, Math.ceil(vmax * LMAP_H) + 2);
+  if (vmin === 0 || vmax === 1 || gap < 0.5) return [[0, y0, LMAP_W, y1 - y0]];
+  const x0 = Math.floor(us[gapAt] * LMAP_W) - 2, w = Math.ceil((1 - gap) * LMAP_W) + 4;
+  const xa = ((x0 % LMAP_W) + LMAP_W) % LMAP_W;
+  if (xa + w <= LMAP_W) return [[xa, y0, w, y1 - y0]];
+  return [[xa, y0, LMAP_W - xa, y1 - y0], [0, y0, xa + w - LMAP_W, y1 - y0]];   // crosses the map's seam
+}
+function linePasses(now) {
+  const vw = vid.videoWidth, vh = vid.videoHeight;
+  const ew = vw >= vh ? EDGE_LONG : Math.round(EDGE_LONG * vw / vh), eh = vw >= vh ? Math.round(EDGE_LONG * vh / vw) : EDGE_LONG;
+  if (!gradT || gradT.w !== ew || gradT.h !== eh) { gradT = makeTarget(ew, eh, gl.NEAREST); edgeT = makeTarget(ew, eh, gl.LINEAR); }
+  if (!lmapT) lmapT = makeTarget(LMAP_W, LMAP_H, gl.LINEAR);
+  gl.bindVertexArray(vaoFull);
+  // 1) GRAD
+  gl.bindFramebuffer(gl.FRAMEBUFFER, gradT.fb); gl.viewport(0, 0, ew, eh); gl.disable(gl.BLEND);
+  gl.useProgram(PG.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, camTex); gl.uniform1i(PG.u.uCam, 0);
+  gl.uniform2f(PG.u.uSize, ew, eh); gl.uniform1f(PG.u.uStep, LINE_WIDTH);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  // 2) THIN (mixed into the last frame's lines)
+  gl.bindFramebuffer(gl.FRAMEBUFFER, edgeT.fb);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.useProgram(PT.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, gradT.tex); gl.uniform1i(PT.u.uGrad, 0);
+  gl.uniform2f(PT.u.uSize, ew, eh); gl.uniform1f(PT.u.uLo, LINE_LO); gl.uniform1f(PT.u.uHi, LINE_HI); gl.uniform1f(PT.u.uCalm, LINE_CALM);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  // 3) KEEP: paint into the room map, for the head as it was when the picture was taken
+  if (S.lkeep) {
+    const qa = headQAt(now - AR_LAG_MS), R = qRot(qa, 1, 0, 0), U = qRot(qa, 0, 1, 0), F = qRot(qa, 0, 0, -1);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, lmapT.fb); gl.viewport(0, 0, LMAP_W, LMAP_H);
+    gl.useProgram(PK.p);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, edgeT.tex); gl.uniform1i(PK.u.uEdgeTex, 0);
+    gl.uniform2f(PK.u.uMap, LMAP_W, LMAP_H); gl.uniform2f(PK.u.uCamTan, camTanNow[0], camTanNow[1]);
+    gl.uniform1i(PK.u.uCamRot, camRotNow); gl.uniform1f(PK.u.uMix, LINE_KEEP_MIX);
+    gl.uniform3f(PK.u.uR, ...R); gl.uniform3f(PK.u.uU, ...U); gl.uniform3f(PK.u.uF, ...F);
+    gl.enable(gl.SCISSOR_TEST);
+    for (const [x, y, w, h] of footprint(R, U, F)) { gl.scissor(x, y, w, h); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+    gl.disable(gl.SCISSOR_TEST);
+  }
+  gl.disable(gl.BLEND);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, cv.width, cv.height);
+}
+function setLineUniforms(u) {
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, edgeT ? edgeT.tex : maskTex); gl.uniform1i(u.uEdgeTex, 4);
+  gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, lmapT ? lmapT.tex : maskTex); gl.uniform1i(u.uWorldL, 5);
+  gl.uniform1i(u.uLStyle, { simple: 0, neon: 1, sketch: 2 }[S.lstyle] || 0);
+  gl.uniform3f(u.uLCol, ...(LINE_COLORS[S.lcol] || LINE_COLORS.white));
+  gl.uniform1f(u.uLKeep, S.lkeep && lmapT ? 1 : 0);
+}
+
 /* ---------- the adjust panel ---------- */
 const panel = document.getElementById("panel");
 // the controls: name, step per press, limits, how the value is shown
@@ -1279,6 +1477,11 @@ function showVals() {
     if (b.dataset.t === "me") b.style.display = ["cam", "scan", "pccam", "hands"].includes(S.place) ? "none" : "";
   }
   document.getElementById("scanhelp").style.display = S.place === "scan" ? "" : "none";
+  document.getElementById("lineopts").style.display = S.place === "scan" ? "" : "none";
+  for (const b of document.querySelectorAll("#lstyle div")) b.classList.toggle("on", b.dataset.ls === S.lstyle);
+  for (const b of document.querySelectorAll("#lcol div")) b.classList.toggle("on", b.dataset.lc === S.lcol);
+  document.getElementById("lcol").style.display = S.lstyle === "sketch" ? "none" : "";
+  document.getElementById("lkeep").classList.toggle("on", !!S.lkeep);
   document.getElementById("pccamhelp").style.display = S.place === "pccam" ? "" : "none";
   document.getElementById("pccode").textContent = pcCode();
   if (S.place === "pccam") startPeer();
@@ -1359,6 +1562,10 @@ for (const b of document.querySelectorAll("#modes div")) b.addEventListener("cli
   S.place = b.dataset.m; save(); showVals(); syncCam();
   pos = [0, 0, 0];                      // a new place: start at its usual spot
 });
+for (const b of document.querySelectorAll("#lstyle div")) b.addEventListener("click", () => { S.lstyle = b.dataset.ls; save(); showVals(); });
+for (const b of document.querySelectorAll("#lcol div")) b.addEventListener("click", () => { S.lcol = b.dataset.lc; save(); showVals(); });
+document.getElementById("lkeep").addEventListener("click", () => { S.lkeep = !S.lkeep; save(); showVals(); });
+document.getElementById("lclear").addEventListener("click", () => { clearLines(); document.getElementById("note").textContent = "残した線を消しました。"; });
 document.getElementById("scanclear").addEventListener("click", () => { clearScans(); document.getElementById("note").textContent = "部屋の地図を消しました。"; });
 for (const b of document.querySelectorAll("#togs div")) b.addEventListener("click", () => {
   S[b.dataset.t] = !S[b.dataset.t]; save(); showVals(); syncCam(); applyStage();
