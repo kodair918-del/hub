@@ -9,8 +9,10 @@
 <title>VR</title>
 <style>
   html, body { margin:0; height:100%; background:#000; overflow:hidden; touch-action:none; -webkit-user-select:none; user-select:none; }
-  canvas { position:fixed; inset:0; width:100vw; height:100vh; height:100dvh; }
-  #panel { z-index:4; position:fixed; left:50%; bottom:0; transform:translateX(-50%); width:min(720px, 100vw); max-height:100dvh; overflow:auto; background:rgba(14,15,18,.82); color:#e8e6e1; font-family:system-ui, -apple-system, "Hiragino Sans", sans-serif; padding:12px 16px 14px; border-radius:16px 16px 0 0; box-sizing:border-box; }
+  /* everything sits on a stage; with the portrait lock on, the stage is turned sideways so the picture stays landscape */
+  #stage { position:fixed; left:0; top:0; width:100vw; height:100vh; height:100dvh; overflow:hidden; transform-origin:50% 50%; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; }
+  #panel { z-index:4; position:absolute; left:50%; bottom:0; transform:translateX(-50%); width:min(720px, 100%); max-height:100%; overflow:auto; background:rgba(14,15,18,.82); color:#e8e6e1; font-family:system-ui, -apple-system, "Hiragino Sans", sans-serif; padding:12px 16px 14px; border-radius:16px 16px 0 0; box-sizing:border-box; }
   #panel.off { display:none; }
   #panel b { font-size:17px; }
   #panel .s { font-size:12px; color:#9aa0ab; line-height:1.6; margin:4px 0 8px; }
@@ -19,8 +21,8 @@
   .row .pm { height:44px; border-radius:12px; background:#2c303b; display:flex; align-items:center; justify-content:center; font-size:24px; font-weight:bold; touch-action:manipulation; }
   .row .pm:active { background:#7fb4ff; color:#0b0b0a; }
   .row .val { text-align:center; font-variant-numeric:tabular-nums; font-size:15px; }
-  .hud { position:fixed; top:22%; transform:translateX(-50%); z-index:3; pointer-events:none; padding:4px 10px; border-radius:8px; background:rgba(0,0,0,.6); color:#bfefff; font:bold 13px system-ui, sans-serif; white-space:nowrap; }
-  #guide { position:fixed; inset:0; width:100vw; height:100vh; height:100dvh; pointer-events:none; z-index:5; }
+  .hud { position:absolute; top:22%; transform:translateX(-50%); z-index:3; pointer-events:none; padding:4px 10px; border-radius:8px; background:rgba(0,0,0,.6); color:#bfefff; font:bold 13px system-ui, sans-serif; white-space:nowrap; }
+  #guide { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:5; }
   .btns { display:flex; gap:8px; margin-top:10px; }
   .btns div { flex:1; text-align:center; padding:11px 0; border-radius:12px; font-weight:bold; font-size:15px; }
   #go { background:#7fb4ff; color:#0b0b0a; }
@@ -34,6 +36,7 @@
 </style>
 </head>
 <body>
+<div id="stage">
 <canvas id="c"></canvas>
 <canvas id="guide"></canvas>
 <div class="hud" id="hudL" style="display:none"></div><div class="hud" id="hudR" style="display:none"></div>
@@ -51,11 +54,12 @@
   <div class="s" id="note"></div>
   <div class="s" id="ver" style="text-align:right;margin:0"></div>
 </div>
+</div>
 <script>
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.9";
+const VERSION = "2026-11-26.10";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -133,6 +137,31 @@ function qRot(q, x, y, z) {
   return [ix*qw + iw*-qx + iy*-qz - iz*-qy, iy*qw + iw*-qy + iz*-qx - ix*-qz, iz*qw + iw*-qz + ix*-qy - iy*-qx];
 }
 
+/* ---------- the stage: turned sideways when the page is portrait (portrait lock on) but the phone sits
+   landscape in the goggles. Then iOS can never flip the picture while you look around. ---------- */
+let ROT = 0, lastGamma = 0;                // 0, 90 or -90: how the stage is turned
+function VW() { return ROT ? innerHeight : innerWidth; }   // the stage's own width / height
+function VH() { return ROT ? innerWidth : innerHeight; }
+function applyStage() {
+  const port = window.started && innerHeight > innerWidth;
+  // which way round the phone sits: gamma is about -90 with its top to the left, +90 with its top to the right
+  if (port && !ROT) ROT = lastGamma < 0 ? 90 : -90;
+  if (!port) ROT = 0;
+  const st = document.getElementById("stage").style;
+  if (ROT) {
+    st.width = innerHeight + "px"; st.height = innerWidth + "px";
+    st.left = (innerWidth - innerHeight) / 2 + "px"; st.top = (innerHeight - innerWidth) / 2 + "px";
+    st.transform = "rotate(" + ROT + "deg)";
+  } else { st.width = ""; st.height = ""; st.left = "0"; st.top = "0"; st.transform = ""; }
+  resize(); drawGuide();
+}
+// a touch point in stage coordinates
+function toStage(e) {
+  if (!ROT) return { x: e.clientX, y: e.clientY };
+  const cx = innerWidth / 2, cy = innerHeight / 2, dx = e.clientX - cx, dy = e.clientY - cy;
+  return ROT > 0 ? { x: VW() / 2 + dy, y: VH() / 2 - dx } : { x: VW() / 2 - dy, y: VH() / 2 + dx };
+}
+
 /* ---------- head orientation ---------- */
 let devQ = null, hasGyro = false;
 let recenter = [0, 0, 0, 1];
@@ -145,7 +174,8 @@ function onOrient(e) {
   const c1 = Math.cos(x/2), c2 = Math.cos(y/2), c3 = Math.cos(z/2), s1 = Math.sin(x/2), s2 = Math.sin(y/2), s3 = Math.sin(z/2);
   let q = [s1*c2*c3 + c1*s2*s3, c1*s2*c3 - s1*c2*s3, c1*c2*s3 - s1*s2*c3, c1*c2*c3 + s1*s2*s3];   // Euler YXZ
   q = qMul(q, Q_BACK);
-  const ang = ((screen.orientation && screen.orientation.angle) || window.orientation || 0) * d;
+  lastGamma = e.gamma;
+  const ang = (ROT || (screen.orientation && screen.orientation.angle) || window.orientation || 0) * d;
   devQ = qMul(q, qAxis(0, 0, 1, -ang));
 }
 function headQ() {
@@ -153,6 +183,7 @@ function headQ() {
   return qMul(qAxis(0, 1, 0, dragYaw), qAxis(1, 0, 0, dragPitch));
 }
 function doRecenter() {
+  if (ROT) { ROT = 0; applyStage(); }   // look again at which way round the phone sits
   if (!devQ) { dragYaw = 0; dragPitch = 0; return; }
   const f = qRot(devQ, 0, 0, -1);
   recenter = qAxis(0, 1, 0, -Math.atan2(-f[0], -f[2]));
@@ -769,7 +800,7 @@ function hud(show) {
   [["hudL", -1], ["hudR", 1]].forEach(([id, side]) => {
     const el = document.getElementById(id);
     el.textContent = txt; el.style.display = on ? "" : "none";
-    el.style.left = (innerWidth / 2 + side * S.sep / 2 * PX_PER_MM) + "px";   // above each lens centre
+    el.style.left = (VW() / 2 + side * S.sep / 2 * PX_PER_MM) + "px";   // above each lens centre
   });
 }
 setInterval(() => hud(false), 300);
@@ -853,11 +884,12 @@ function setScanUniforms(u) {
 let mmW = 0, mmH = 0;
 function resize() {
   const sc = Math.min(RENDER_SCALE, devicePixelRatio || 1);
-  cv.width = Math.round(innerWidth * sc); cv.height = Math.round(innerHeight * sc);
-  mmW = innerWidth / PX_PER_MM; mmH = innerHeight / PX_PER_MM;
+  cv.width = Math.round(VW() * sc); cv.height = Math.round(VH() * sc);
+  mmW = VW() / PX_PER_MM; mmH = VH() / PX_PER_MM;
   gl.viewport(0, 0, cv.width, cv.height);
 }
-addEventListener("resize", resize);
+addEventListener("resize", applyStage);
+addEventListener("orientationchange", () => setTimeout(applyStage, 300));
 resize();
 
 /* ---------- snow ---------- */
@@ -869,7 +901,7 @@ let T = 0;
 const WALK_SPEED = 4.5;                 // metres per second (a light run; a walk is 1.4)
 const WALK_ZONE = { w: 0.4, h: 1.0 };   // the touch area: middle 40% of the width, any height
 let pos = [0, 0, 0], walking = 0;
-function inWalkZone(x, y) { return Math.abs(x / innerWidth - 0.5) < WALK_ZONE.w / 2 && y / innerHeight < WALK_ZONE.h; }
+function inWalkZone(x, y) { return Math.abs(x / VW() - 0.5) < WALK_ZONE.w / 2 && y / VH() < WALK_ZONE.h; }
 function stepWalk(dt, F) {
   if (!walking) return;
   const l = Math.hypot(F[0], F[2]);
@@ -1064,14 +1096,14 @@ async function syncCam() {
 const gcv = document.getElementById("guide"), gctx = gcv.getContext("2d");
 function drawGuide() {
   const dpr = devicePixelRatio || 1;
-  gcv.width = Math.round(innerWidth * dpr); gcv.height = Math.round(innerHeight * dpr);
+  gcv.width = Math.round(VW() * dpr); gcv.height = Math.round(VH() * dpr);
   gctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  gctx.clearRect(0, 0, innerWidth, innerHeight);
+  gctx.clearRect(0, 0, VW(), VH());
   if (document.getElementById("panel").classList.contains("off")) return;
-  const mm = PX_PER_MM, cy = innerHeight / 2 - S.vy * mm;
+  const mm = PX_PER_MM, cy = VH() / 2 - S.vy * mm;
   gctx.strokeStyle = "#ffd84a"; gctx.lineWidth = 2;
   for (const side of [-1, 1]) {
-    const cx = innerWidth / 2 + side * S.sep / 2 * mm;
+    const cx = VW() / 2 + side * S.sep / 2 * mm;
     gctx.beginPath();
     gctx.moveTo(cx - 12 * mm, cy); gctx.lineTo(cx + 12 * mm, cy);
     gctx.moveTo(cx, cy - 12 * mm); gctx.lineTo(cx, cy + 12 * mm);
@@ -1079,9 +1111,9 @@ function drawGuide() {
     gctx.beginPath(); gctx.arc(cx, cy, 8 * mm, 0, 2 * Math.PI); gctx.stroke();
   }
   gctx.strokeStyle = "rgba(255,255,255,.35)"; gctx.lineWidth = 1;
-  gctx.beginPath(); gctx.moveTo(innerWidth / 2, 0); gctx.lineTo(innerWidth / 2, innerHeight); gctx.stroke();
+  gctx.beginPath(); gctx.moveTo(VW() / 2, 0); gctx.lineTo(VW() / 2, VH()); gctx.stroke();
 }
-addEventListener("resize", drawGuide);
+
 for (const b of document.querySelectorAll("#modes div")) b.addEventListener("click", () => {
   S.place = b.dataset.m; save(); showVals(); syncCam();
   pos = [0, 0, 0];                      // a new place: start at its usual spot
@@ -1114,6 +1146,7 @@ document.getElementById("go").addEventListener("click", async () => {
     keepAwake();
     if (needsCam() && !(await syncCam())) return;
     window.started = true;
+    applyStage();
     document.getElementById("go").textContent = "つづける";
     if (S.place === "scan" && SCAN_AI) scanLoop();
     setTimeout(doRecenter, 400);
@@ -1127,19 +1160,21 @@ document.getElementById("go").addEventListener("click", async () => {
 let drag = null, tapTimer = 0, lastTap = 0;
 const walkers = new Set();
 cv.addEventListener("pointerdown", e => {
-  if (window.started && inWalkZone(e.clientX, e.clientY)) {
+  const p = toStage(e);
+  if (window.started && inWalkZone(p.x, p.y)) {
     if (S.place === "scan") { lineMode = !lineMode; hud(true); return; }   // in the room scan, the same spot switches the line world
     walkers.add(e.pointerId); walking = walkers.size; return;
   }
-  drag = { x: e.clientX, y: e.clientY, yaw: dragYaw, pitch: dragPitch, moved: false };
+  drag = { x: p.x, y: p.y, yaw: dragYaw, pitch: dragPitch, moved: false };
 });
 for (const ev of ["pointerup", "pointercancel"]) addEventListener(ev, e => { if (walkers.delete(e.pointerId)) walking = walkers.size; });
 addEventListener("pointermove", e => {
   if (!drag) return;
-  if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 8) drag.moved = true;
+  const p = toStage(e);
+  if (Math.abs(p.x - drag.x) + Math.abs(p.y - drag.y) > 8) drag.moved = true;
   if (hasGyro) return;
-  dragYaw = drag.yaw + (e.clientX - drag.x) * 0.005;
-  dragPitch = Math.max(-1.4, Math.min(1.4, drag.pitch + (e.clientY - drag.y) * 0.005));
+  dragYaw = drag.yaw + (p.x - drag.x) * 0.005;
+  dragPitch = Math.max(-1.4, Math.min(1.4, drag.pitch + (p.y - drag.y) * 0.005));
 });
 cv.addEventListener("pointerup", () => {
   if (!drag) return;                    // the finger was walking
