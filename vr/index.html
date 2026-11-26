@@ -44,12 +44,12 @@
 <video id="pcvid" playsinline muted autoplay></video>
 <div id="panel">
   <b>VR</b>
-  <div class="s">黄色い十字が、それぞれのレンズの真ん中に来るように合わせてください（押し続けると連続で動きます）。<br>ゴーグルの中で：カメラ使用中は画面中央の上半分を押すと倍率が×5／元に切り替わります。カメラを使わないモードでは画面中央を押している間、向いている方へ歩きます。ほかを1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
+  <div class="s">黄色い十字が、それぞれのレンズの真ん中に来るように合わせてください（押し続けると連続で動きます）。<br>ゴーグルの中で：カメラ使用中は画面中央の上半分を押すとカメラの倍率が×5／元に切り替わります。カメラを使わないモードでは画面中央を押している間、向いている方へ歩きます。ほかを1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
   <div class="modes" id="modes"><div data-m="river">夜の川辺</div><div data-m="sunset">夕焼けの海</div><div data-m="meadow">昼の草原</div><div data-m="space">宇宙</div><div data-m="cam">カメラ</div><div data-m="scan">部屋スキャン</div><div data-m="pccam">PCカメラ</div><div data-m="hands">手で遊ぶ(AR)</div></div>
   <div class="modes" id="togs"><div data-t="snow">雪</div><div data-t="me">自分を映す</div><div data-t="flip">向きを反転</div></div>
   <div id="ctl"></div>
   <div class="s" id="pccamhelp" style="display:none">PCカメラ：PC で <b style="font-size:12px">kodair918-del.github.io/hub/pccam/</b> を開いて、番号 <b id="pccode" style="font-size:20px;color:#7fb4ff;letter-spacing:.15em"></b> を入れて「送る」を押すと、PC のカメラの映像が視界いっぱいに出ます。<span id="pcstate"></span></div>
-  <div class="s" id="scanhelp" style="display:none">部屋スキャン：画面中央の下半分を押すと「線画」に切り替わり、もう一度押すとカメラに戻ります。上半分を押すと倍率が×5／元に切り替わります。「線を部屋に残す」なら、見回すほど部屋じゅうが線画になっていきます。<span id="scanclear" style="display:none"></span></div>
+  <div class="s" id="scanhelp" style="display:none">部屋スキャン：画面中央の下半分を押すと「線画」に切り替わり、もう一度押すとカメラに戻ります。上半分を押すとカメラの倍率が×5／元に切り替わります。「線を部屋に残す」なら、見回すほど部屋じゅうが線画になっていきます。<span id="scanclear" style="display:none"></span></div>
   <div id="lineopts" style="display:none">
     <div class="modes" id="lstyle"><div data-ls="simple">シンプル</div><div data-ls="neon">ネオン</div><div data-ls="sketch">手描き</div></div>
     <div class="modes" id="lcol"><div data-lc="white">白</div><div data-lc="cyan">水色</div><div data-lc="green">緑</div><div data-lc="pink">ピンク</div></div>
@@ -64,7 +64,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.18";
+const VERSION = "2026-11-26.19";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -121,9 +121,34 @@ if (S.mode) {   // settings saved by the older page
   S.place = S.mode === "scene" ? "river" : "cam"; S.snow = S.mode !== "cam"; delete S.mode;
 }
 if (!PLACES.includes(S.place)) S.place = "river";
+// the quick zoom (middle top half while a camera is on): the camera's own lens ×5, or back to normal
 const QUICK_CAMERA_ZOOM = 5;
 let cameraZoomed = false;
+let camHwZoom = 1;                  // what the phone's own lens is actually set to
+// how big the picture should look in total: ×5 while the quick zoom is on, else the panel's "カメラの大きさ"
 function cameraZoomValue() { return cameraZoomed ? QUICK_CAMERA_ZOOM : S.zoom; }
+// the part the shader does by cropping; the lens does the rest (a lens ×5 stays sharp, a crop does not)
+function camDigitalFactor() { return cameraZoomValue() / (camHwZoom > 1 ? camHwZoom : 1); }
+function camTrack() { return camOn && vid.srcObject ? vid.srcObject.getVideoTracks()[0] : null; }
+function camZoomMax() {
+  const t = camTrack(), z = t && t.getCapabilities ? t.getCapabilities().zoom : null;
+  return z && z.max > 1 ? z.max : 0;     // 0 = this camera cannot zoom its lens
+}
+// ask the camera to zoom its own lens; answers whether the lens took it
+async function applyCamZoom() {
+  const t = camTrack(), max = camZoomMax();
+  const want = cameraZoomed && max ? Math.min(cameraZoomValue(), max) : 1;
+  if (!t) { camHwZoom = 1; return false; }
+  if (Math.abs(want - camHwZoom) < 0.02) return camHwZoom > 1;
+  camHwZoom = want;   // believed until the read-back says otherwise, so the crop never doubles on top
+  for (const c of [{ zoom: want }, { advanced: [{ zoom: want }] }]) {
+    try { await t.applyConstraints(c); } catch (e) { continue; }
+    const got = (t.getSettings && t.getSettings().zoom) || 1;
+    if (Math.abs(got - want) < 0.05) { camHwZoom = got; return true; }
+  }
+  camHwZoom = 1;      // the lens would not move: crop the picture instead
+  return false;
+}
 const SEG_THRESHOLD = [0.45, 0.7];   // mask values between these fade from place to camera (the body's edge)
 // the person-cutout model (MediaPipe, runs on the phone; nothing is sent anywhere)
 const MP_VER = "0.10.14";
@@ -861,7 +886,8 @@ function hud(show) {
     S.place === "pccam" ? (pcConnected ? "PC カメラ" : "PC を待っています　番号 " + pcCode()) :
     (lineMode ? "線画 ON" : "カメラ") + (!SCAN_AI ? "" : "　" +
     (scanErr ? "AI エラー" : scannerReady ? "スキャン " + scanCount + " 回" : "AI 読み込み中…"));
-  const label = usesCamera() ? "　×" + (cameraZoomed ? QUICK_CAMERA_ZOOM : S.zoom).toFixed(cameraZoomed ? 0 : 2) : "";
+  const label = usesCamera() ? "　×" + cameraZoomValue().toFixed(cameraZoomed ? 0 : 2) +
+    (cameraZoomed ? (camHwZoom > 1.05 ? "（レンズ）" : "（拡大）") : "") : "";
   [["hudL", -1], ["hudR", 1]].forEach(([id, side]) => {
     const el = document.getElementById(id);
     el.textContent = txt + label; el.style.display = on ? "" : "none";
@@ -909,7 +935,7 @@ async function scanOnce() {
   try {
     const q = headQ();
     const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
-    const th = CAM_TAN_H / cameraZoomValue(), tv = th * vid.videoHeight / vid.videoWidth;
+    const th = CAM_TAN_H / camDigitalFactor(), tv = th * vid.videoHeight / vid.videoWidth;
     const w = SCAN_W, h = Math.round(SCAN_W * vid.videoHeight / vid.videoWidth);
     // shrink on a canvas first: Safari does not always honour createImageBitmap's resize options
     if (!scanShot) scanShot = document.createElement("canvas");
@@ -993,7 +1019,9 @@ async function startCam() {
   if (camOn) return true;
   try {
     const st = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
-    vid.srcObject = st; await vid.play(); camOn = true; return true;
+    vid.srcObject = st; await vid.play(); camOn = true; camHwZoom = 1;
+    if (cameraZoomed) await applyCamZoom();
+    return true;
   } catch (e) {
     document.getElementById("note").textContent = "カメラが使えませんでした（" + (e.name || e) + "）。設定 → Safari → カメラ を「許可」にしてください。";
     return false;
@@ -1002,7 +1030,7 @@ async function startCam() {
 function stopCam() {
   if (!camOn) return;
   for (const t of vid.srcObject.getTracks()) t.stop();
-  vid.srcObject = null; camOn = false;
+  vid.srcObject = null; camOn = false; camHwZoom = 1;
 }
 
 /* ---------- each frame ---------- */
@@ -1044,7 +1072,7 @@ function frame(now) {
   // the goggles' left-right, so it is read turned by the stage's turn. (The PC camera always comes landscape.)
   const vw = src.videoWidth || 4, vh = src.videoHeight || 3;
   const camRot = !pc && ROT && vh > vw ? ROT : 0;
-  const tLong = (pc ? PCCAM_TAN_H : CAM_TAN_H) / cameraZoomValue(); // half-view along the picture's long side
+  const tLong = (pc ? PCCAM_TAN_H : CAM_TAN_H) / camDigitalFactor(); // half-view along the picture's long side; the lens may already be zoomed
   if (camRot) gl.uniform2f(u.uCamTan, tLong * vw / vh, tLong);
   else gl.uniform2f(u.uCamTan, tLong, tLong * vh / vw);
   gl.uniform1i(u.uCamRot, camRot);
@@ -1624,6 +1652,12 @@ cv.addEventListener("pointerdown", e => {
   if (window.started && usesCamera() && inCameraZoomZone(p.x, p.y)) {
     cameraZoomed = !cameraZoomed;
     hud(true);
+    applyCamZoom().then(lensOk => {
+      hud(true);
+      if (cameraZoomed) document.getElementById("note").textContent = lensOk
+        ? "カメラのレンズを×5にしました。もう一度押すと元の倍率に戻ります。"
+        : "この端末のカメラはレンズの倍率を変えられないため、画面を拡大しています（遠くはぼやけます）。";
+    });
     return;
   }
   if (window.started && inWalkZone(p.x, p.y)) {
