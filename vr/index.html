@@ -51,7 +51,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.2";
+const VERSION = "2026-11-26.3";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -198,14 +198,7 @@ vec3 lineWorld(vec3 d, vec2 uv, bool camIn) {
     float g = smoothstep(0.47, 0.5, max(f.x, f.y));
     col = mix(col, pc * 0.8, g * clamp(3.0 * d.y, 0.0, 1.0));
   }
-  // edges in the live camera picture (Sobel)
-  if (camIn) {
-    vec2 t = uCamTexel * 1.5;
-    float gx = lum(uv + vec2(t.x, 0)) - lum(uv - vec2(t.x, 0));
-    float gy = lum(uv + vec2(0, t.y)) - lum(uv - vec2(0, t.y));
-    float m = length(vec2(gx, gy));
-    col = mix(col, vec3(0.75, 0.95, 1.0), smoothstep(0.08, 0.25, m) * 0.55);
-  }
+  // (the live camera's own edges were drawn here once; they flickered and cluttered the view, so they are gone)
   return col;
 }
 
@@ -584,29 +577,111 @@ function scanColor(label) {
   return [f(0), f(8), f(4)].map(Math.round);
 }
 /* The room map: one label per direction around you (an equirectangular picture, like a world map
-   wrapped around your head). Every scan writes what it saw into the directions it covered, so the map
-   fills in as you look around, and newer scans replace older ones. */
-let scanner = null, scannerLoading = null, scanBusy = false, scanLooping = false, lineMode = false;
-const worldIds = new Uint8Array(WORLD_W * WORLD_H);
-const labelIds = new Map();            // label -> 1..255 (0 = not seen yet)
-const palette = new Uint8Array(256 * 4);
-let worldDirty = false, palDirty = false, lastShares = "";
+   wrapped around your head). The AI and all the map work run in a Web Worker, so the drawing never
+   waits for them; the page only hands over a camera frame and uploads the part of the map that changed.
+   To keep the lines steady, each scan is cleaned up (small specks take their neighbours' label) and the
+   map only changes its mind about a direction after several scans agree. */
+const SCAN_WORKER = `
+let tf = null, seg = null, W = 0, H = 0, world = null, conf = null;
+const labelIds = new Map();
 function idFor(label) {
   let id = labelIds.get(label);
-  if (id) return id;
-  if (labelIds.size >= 254) return 255;
-  id = labelIds.size + 1; labelIds.set(label, id);
-  const [r, g, b] = scanColor(label);
-  palette.set([r, g, b, 255], id * 4); palDirty = true;
+  if (!id) { id = Math.min(255, labelIds.size + 1); labelIds.set(label, id); }
   return id;
 }
+self.onmessage = async ev => {
+  const m = ev.data;
+  try {
+    if (m.type === "init") {
+      W = m.W; H = m.H; world = new Uint8Array(W * H); conf = new Uint8Array(W * H);
+      tf = await import("https://cdn.jsdelivr.net/npm/@huggingface/transformers@" + m.tfVer);
+      if (self.navigator && self.navigator.gpu) { try { seg = await tf.pipeline("image-segmentation", m.model, { device: "webgpu" }); } catch (e) { seg = null; } }
+      if (!seg) seg = await tf.pipeline("image-segmentation", m.model);
+      self.postMessage({ type: "ready" });
+      return;
+    }
+    if (m.type === "clear") { world.fill(0); conf.fill(0); return; }
+    if (m.type !== "scan") return;
+    const { w, h, R, U, F, th, tv } = m;
+    const oc = new OffscreenCanvas(w, h), cx = oc.getContext("2d");
+    cx.drawImage(m.bitmap, 0, 0, w, h); m.bitmap.close();
+    const img = cx.getImageData(0, 0, w, h);
+    const t0 = performance.now();
+    const parts = await seg(new tf.RawImage(img.data, w, h, 4));
+    const ms = Math.round(performance.now() - t0);
+    // labels per pixel
+    let ids = new Uint8Array(w * h);
+    const fresh = [], count = new Map();
+    for (const p of parts) {
+      const label = String(p.label).trim(), mk = p.mask, d = mk.data, step = d.length / (mk.width * mk.height);
+      const known = labelIds.has(label), id = idFor(label);
+      if (!known) fresh.push([label, id]);
+      let n = 0;
+      for (let y = 0; y < h; y++) {
+        const my = Math.min(mk.height - 1, Math.floor(y * mk.height / h));
+        for (let x = 0; x < w; x++) {
+          const mx = Math.min(mk.width - 1, Math.floor(x * mk.width / w));
+          if (d[(my * mk.width + mx) * step] >= 128) { ids[y * w + x] = id; n++; }
+        }
+      }
+      if (n) count.set(label, n);
+    }
+    // clean-up: each pixel takes the most common label around it (5x5), which removes specks and ragged edges
+    const out = new Uint8Array(w * h), tally = new Uint16Array(256);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let best = 0, bestN = 0;
+      const touched = [];
+      for (let j = -2; j <= 2; j++) { const yy = y + j; if (yy < 0 || yy >= h) continue;
+        for (let i = -2; i <= 2; i++) { const xx = x + i; if (xx < 0 || xx >= w) continue;
+          const v = ids[yy * w + xx]; if (!v) continue;
+          if (tally[v] === 0) touched.push(v);
+          const n = ++tally[v]; if (n > bestN) { bestN = n; best = v; } } }
+      out[y * w + x] = best;
+      for (const v of touched) tally[v] = 0;
+    }
+    ids = out;
+    // into the room map, with a vote: a direction keeps its label until several scans say otherwise
+    let x0 = W, x1 = -1, y0 = H, y1 = -1;
+    const put = (idx, id) => {
+      if (world[idx] === id) { if (conf[idx] < ${4}) conf[idx]++; }
+      else if (conf[idx] > 1) conf[idx]--;
+      else { world[idx] = id; conf[idx] = world[idx] ? 2 : 1; }
+    };
+    for (let y = 0; y < h; y++) {
+      const ty = (0.5 - (y + 0.5) / h) * 2 * tv;
+      for (let x = 0; x < w; x++) {
+        const id = ids[y * w + x]; if (!id) continue;
+        const tx = ((x + 0.5) / w - 0.5) * 2 * th;
+        let dx = F[0] + R[0] * tx + U[0] * ty, dy = F[1] + R[1] * tx + U[1] * ty, dz = F[2] + R[2] * tx + U[2] * ty;
+        const l = 1 / Math.hypot(dx, dy, dz); dx *= l; dy *= l; dz *= l;
+        const u = Math.atan2(dx, -dz) / (2 * Math.PI) + 0.5, v = Math.acos(Math.max(-1, Math.min(1, dy))) / Math.PI;
+        const X = Math.floor(u * W) % W, Y = Math.min(H - 1, Math.floor(v * H));
+        put(Y * W + X, id); put(Y * W + (X + 1) % W, id);
+        if (X < x0) x0 = X; if (X + 1 > x1) x1 = X + 1; if (Y < y0) y0 = Y; if (Y > y1) y1 = Y;
+      }
+    }
+    if (x1 < 0) { self.postMessage({ type: "scanned", ms, fresh, shares: [] }); return; }
+    if (x1 - x0 > W / 2 || x1 >= W) { x0 = 0; x1 = W - 1; }   // the scan crossed the map's seam: send whole rows
+    const rw = x1 - x0 + 1, rh = y1 - y0 + 1, rect = new Uint8Array(rw * rh);
+    for (let y = 0; y < rh; y++) rect.set(world.subarray((y0 + y) * W + x0, (y0 + y) * W + x0 + rw), y * rw);
+    const total = w * h, shares = [...count].map(([k, n]) => [k, n / total]).sort((a, b) => b[1] - a[1]);
+    self.postMessage({ type: "scanned", ms, fresh, shares, x: x0, y: y0, rw, rh, rect }, [rect.buffer]);
+  } catch (e) {
+    self.postMessage({ type: "error", msg: String(e && e.message || e) });
+  }
+};`;
+
+let scanWorker = null, scannerReady = false, scanBusy = false, scanLooping = false, lineMode = false;
+const labelIds = new Map();
+const palette = new Uint8Array(256 * 4);
+let palDirty = false;
 const worldTex = gl.createTexture();
 gl.bindTexture(gl.TEXTURE_2D, worldTex);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, WORLD_W, WORLD_H, 0, gl.RED, gl.UNSIGNED_BYTE, worldIds);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, WORLD_W, WORLD_H, 0, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(WORLD_W * WORLD_H));
 const palTex = gl.createTexture();
 gl.bindTexture(gl.TEXTURE_2D, palTex);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -615,67 +690,49 @@ gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, palette);
 
-async function loadScanner() {
-  if (scanner) return scanner;
-  if (scannerLoading) return scannerLoading;
-  const note = document.getElementById("note");
-  scannerLoading = (async () => {
-    note.textContent = "部屋を調べる AI を読み込んでいます（はじめは十数 MB、数十秒かかることがあります）…";
-    const tf = await import(`https://cdn.jsdelivr.net/npm/@huggingface/transformers@${TF_VER}`);
-    let p = null;
-    if (navigator.gpu) { try { p = await tf.pipeline("image-segmentation", SCAN_MODEL, { device: "webgpu" }); } catch (e) { p = null; } }
-    if (!p) p = await tf.pipeline("image-segmentation", SCAN_MODEL);
-    scanner = p; note.textContent = "スキャン中：見回すと部屋の地図ができていきます。中央の上を押すと線画の世界に切り替わります。";
-    return p;
-  })().catch(e => { note.textContent = "部屋を調べる AI を読み込めませんでした（" + (e.message || e) + "）"; scannerLoading = null; return null; });
-  return scannerLoading;
+let scanResolve = null;
+function onScanMessage(ev) {
+  const m = ev.data, note = document.getElementById("note");
+  if (m.type === "ready") {
+    scannerReady = true;
+    note.textContent = "スキャン中：見回すと部屋の地図ができていきます。中央の上を押すと線画の世界に切り替わります。";
+  } else if (m.type === "error") {
+    note.textContent = "部屋を調べる AI でエラー（" + m.msg + "）";
+  } else if (m.type === "scanned") {
+    for (const [label, id] of m.fresh) {
+      labelIds.set(label, id);
+      const [r, g, b] = scanColor(label);
+      palette.set([r, g, b, 255], id * 4); palDirty = true;
+    }
+    if (m.rect) {
+      gl.bindTexture(gl.TEXTURE_2D, worldTex);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, m.x, m.y, m.rw, m.rh, gl.RED, gl.UNSIGNED_BYTE, m.rect);
+    }
+    if (m.shares.length) note.textContent = "いま見ている所（" + m.ms + "ms）：" +
+      m.shares.slice(0, 6).map(([k, s]) => (SCAN_JA[k] || k) + " " + Math.round(s * 100) + "%").join("・");
+  }
+  if (m.type !== "ready" && scanResolve) { const r = scanResolve; scanResolve = null; r(); }
 }
-// one scan: freeze the picture and the head's direction, ask the AI, write the labels into the room map
+function loadScanner() {
+  if (scanWorker) return;
+  document.getElementById("note").textContent = "部屋を調べる AI を読み込んでいます（はじめは十数 MB、数十秒かかることがあります）…";
+  const url = URL.createObjectURL(new Blob([SCAN_WORKER], { type: "text/javascript" }));
+  scanWorker = new Worker(url, { type: "module" });
+  scanWorker.onmessage = onScanMessage;
+  scanWorker.onerror = e => { document.getElementById("note").textContent = "部屋を調べる AI を動かせませんでした（" + (e.message || "worker") + "）"; };
+  scanWorker.postMessage({ type: "init", tfVer: TF_VER, model: SCAN_MODEL, W: WORLD_W, H: WORLD_H });
+}
+// one scan: the frame and the head's direction go to the worker; the page keeps drawing meanwhile
 async function scanOnce() {
-  if (scanBusy || !camOn || vid.readyState < 2 || !vid.videoWidth) return;
+  if (scanBusy || !scannerReady || !camOn || vid.readyState < 2 || !vid.videoWidth) return;
   scanBusy = true;
   try {
     const q = headQ();
     const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
     const th = CAM_TAN_H / S.zoom, tv = th * vid.videoHeight / vid.videoWidth;
     const w = SCAN_W, h = Math.round(SCAN_W * vid.videoHeight / vid.videoWidth);
-    const shot = document.createElement("canvas"); shot.width = w; shot.height = h;
-    shot.getContext("2d").drawImage(vid, 0, 0, w, h);
-    const seg = await loadScanner();
-    if (!seg) return;
-    const t0 = performance.now();
-    const parts = await seg(shot.toDataURL("image/jpeg", 0.85));
-    const ms = Math.round(performance.now() - t0);
-    const ids = new Uint8Array(w * h), shares = [];
-    for (const p of parts) {
-      const label = String(p.label).trim(), m = p.mask, d = m.data, step = d.length / (m.width * m.height);
-      const id = idFor(label);
-      let n = 0;
-      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-        const mx = Math.min(m.width - 1, Math.floor(x * m.width / w)), my = Math.min(m.height - 1, Math.floor(y * m.height / h));
-        if (d[(my * m.width + mx) * step] < 128) continue;
-        ids[y * w + x] = id; n++;
-      }
-      if (n) shares.push([SCAN_JA[label] || label, n / (w * h)]);
-    }
-    // into the room map, by direction (two map pixels per scan pixel across, so no gaps)
-    for (let y = 0; y < h; y++) {
-      const ty = (0.5 - (y + 0.5) / h) * 2 * tv;
-      for (let x = 0; x < w; x++) {
-        const id = ids[y * w + x]; if (!id) continue;
-        const tx = ((x + 0.5) / w - 0.5) * 2 * th;
-        let dx = F[0] + R[0] * tx + U[0] * ty, dy = F[1] + R[1] * tx + U[1] * ty, dz = F[2] + R[2] * tx + U[2] * ty;
-        const l = 1 / Math.hypot(dx, dy, dz); dx *= l; dy *= l; dz *= l;
-        const u = Math.atan2(dx, -dz) / (2 * PI) + 0.5, v = Math.acos(Math.max(-1, Math.min(1, dy))) / PI;
-        const X = Math.floor(u * WORLD_W) % WORLD_W, Y = Math.min(WORLD_H - 1, Math.floor(v * WORLD_H));
-        worldIds[Y * WORLD_W + X] = id; worldIds[Y * WORLD_W + (X + 1) % WORLD_W] = id;
-        if (Y + 1 < WORLD_H) worldIds[(Y + 1) * WORLD_W + X] = id;
-      }
-    }
-    worldDirty = true;
-    shares.sort((a, b) => b[1] - a[1]);
-    lastShares = "いま見ている所（" + ms + "ms）：" + shares.slice(0, 6).map(([n, s]) => n + " " + Math.round(s * 100) + "%").join("・");
-    document.getElementById("note").textContent = lastShares;
+    const bitmap = await createImageBitmap(vid, { resizeWidth: w, resizeHeight: h });
+    await new Promise(res => { scanResolve = res; scanWorker.postMessage({ type: "scan", bitmap, w, h, R, U, F, th, tv }, [bitmap]); });
   } catch (e) {
     document.getElementById("note").textContent = "スキャンできませんでした（" + (e.message || e) + "）";
   } finally { scanBusy = false; }
@@ -686,13 +743,16 @@ async function scanLoop() {
   scanLooping = true;
   while (S.place === "scan" && window.started) {
     await scanOnce();
-    await new Promise(r => setTimeout(r, SCAN_GAP_MS));
+    await new Promise(r => setTimeout(r, scannerReady ? SCAN_GAP_MS : 500));
   }
   scanLooping = false;
 }
-function clearScans() { worldIds.fill(0); worldDirty = true; }
+function clearScans() {
+  if (scanWorker) scanWorker.postMessage({ type: "clear" });
+  gl.bindTexture(gl.TEXTURE_2D, worldTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, WORLD_W, WORLD_H, gl.RED, gl.UNSIGNED_BYTE, new Uint8Array(WORLD_W * WORLD_H));
+}
 function setScanUniforms(u) {
-  if (worldDirty) { gl.bindTexture(gl.TEXTURE_2D, worldTex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, WORLD_W, WORLD_H, gl.RED, gl.UNSIGNED_BYTE, worldIds); worldDirty = false; }
   if (palDirty) { gl.bindTexture(gl.TEXTURE_2D, palTex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 256, 1, gl.RGBA, gl.UNSIGNED_BYTE, palette); palDirty = false; }
   gl.uniform1i(u.uWorld, 2); gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, worldTex);
   gl.uniform1i(u.uPal, 3); gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, palTex);
