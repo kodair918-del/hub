@@ -44,12 +44,12 @@
 <video id="pcvid" playsinline muted autoplay></video>
 <div id="panel">
   <b>VR</b>
-  <div class="s">黄色い十字が、それぞれのレンズの真ん中に来るように合わせてください（押し続けると連続で動きます）。<br>ゴーグルの中で：画面の<b style="font-size:12px">真ん中を押している間 → 向いている方へ歩く</b>／ほかを1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
+  <div class="s">黄色い十字が、それぞれのレンズの真ん中に来るように合わせてください（押し続けると連続で動きます）。<br>ゴーグルの中で：カメラ使用中は画面中央の上半分を押すと倍率が×5／元に切り替わります。カメラを使わないモードでは画面中央を押している間、向いている方へ歩きます。ほかを1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
   <div class="modes" id="modes"><div data-m="river">夜の川辺</div><div data-m="sunset">夕焼けの海</div><div data-m="meadow">昼の草原</div><div data-m="space">宇宙</div><div data-m="cam">カメラ</div><div data-m="scan">部屋スキャン</div><div data-m="pccam">PCカメラ</div><div data-m="hands">手で遊ぶ(AR)</div></div>
   <div class="modes" id="togs"><div data-t="snow">雪</div><div data-t="me">自分を映す</div><div data-t="flip">向きを反転</div></div>
   <div id="ctl"></div>
   <div class="s" id="pccamhelp" style="display:none">PCカメラ：PC で <b style="font-size:12px">kodair918-del.github.io/hub/pccam/</b> を開いて、番号 <b id="pccode" style="font-size:20px;color:#7fb4ff;letter-spacing:.15em"></b> を入れて「送る」を押すと、PC のカメラの映像が視界いっぱいに出ます。<span id="pcstate"></span></div>
-  <div class="s" id="scanhelp" style="display:none">部屋スキャン：画面の真ん中を押すと「線画」に切り替わり、もう一度押すとカメラに戻ります。「線を部屋に残す」なら、見回すほど部屋じゅうが線画になっていきます。<span id="scanclear" style="display:none"></span></div>
+  <div class="s" id="scanhelp" style="display:none">部屋スキャン：画面中央の下半分を押すと「線画」に切り替わり、もう一度押すとカメラに戻ります。上半分を押すと倍率が×5／元に切り替わります。「線を部屋に残す」なら、見回すほど部屋じゅうが線画になっていきます。<span id="scanclear" style="display:none"></span></div>
   <div id="lineopts" style="display:none">
     <div class="modes" id="lstyle"><div data-ls="simple">シンプル</div><div data-ls="neon">ネオン</div><div data-ls="sketch">手描き</div></div>
     <div class="modes" id="lcol"><div data-lc="white">白</div><div data-lc="cyan">水色</div><div data-lc="green">緑</div><div data-lc="pink">ピンク</div></div>
@@ -64,7 +64,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.17";
+const VERSION = "2026-11-26.18";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -121,6 +121,9 @@ if (S.mode) {   // settings saved by the older page
   S.place = S.mode === "scene" ? "river" : "cam"; S.snow = S.mode !== "cam"; delete S.mode;
 }
 if (!PLACES.includes(S.place)) S.place = "river";
+const QUICK_CAMERA_ZOOM = 5;
+let cameraZoomed = false;
+function cameraZoomValue() { return cameraZoomed ? QUICK_CAMERA_ZOOM : S.zoom; }
 const SEG_THRESHOLD = [0.45, 0.7];   // mask values between these fade from place to camera (the body's edge)
 // the person-cutout model (MediaPipe, runs on the phone; nothing is sent anywhere)
 const MP_VER = "0.10.14";
@@ -852,15 +855,16 @@ function hud(show) {
   if (show) hudUntil = performance.now() + 2500;
   const pcWait = S.place === "pccam" && !pcConnected;
   const handsWait = S.place === "hands" && !hands;
-  const on = window.started && (pcWait || handsWait || ((S.place === "pccam" || S.place === "hands") && performance.now() < hudUntil) ||
+  const on = window.started && ((usesCamera() && (cameraZoomed || performance.now() < hudUntil)) || pcWait || handsWait || ((S.place === "pccam" || S.place === "hands") && performance.now() < hudUntil) ||
     (S.place === "scan" && (performance.now() < hudUntil || (SCAN_AI && (!scannerReady || scanErr)))));
   const txt = S.place === "hands" ? (handsErr ? "手の AI を読み込めません" : hands ? "割った数 " + popped : "手の AI を読み込み中…") :
     S.place === "pccam" ? (pcConnected ? "PC カメラ" : "PC を待っています　番号 " + pcCode()) :
     (lineMode ? "線画 ON" : "カメラ") + (!SCAN_AI ? "" : "　" +
     (scanErr ? "AI エラー" : scannerReady ? "スキャン " + scanCount + " 回" : "AI 読み込み中…"));
+  const label = usesCamera() ? "　×" + (cameraZoomed ? QUICK_CAMERA_ZOOM : S.zoom).toFixed(cameraZoomed ? 0 : 2) : "";
   [["hudL", -1], ["hudR", 1]].forEach(([id, side]) => {
     const el = document.getElementById(id);
-    el.textContent = txt; el.style.display = on ? "" : "none";
+    el.textContent = txt + label; el.style.display = on ? "" : "none";
     el.style.left = (VW() / 2 + side * S.sep / 2 * PX_PER_MM) + "px";   // above each lens centre
   });
 }
@@ -871,7 +875,7 @@ function onScanMessage(ev) {
   if (m.type === "error") scanErr = m.msg;
   if (m.type === "ready") {
     scannerReady = true; hud(true);
-    note.textContent = "スキャン中：見回すと部屋の地図ができていきます。中央の上を押すと線画の世界に切り替わります。";
+    note.textContent = "スキャン中：見回すと部屋の地図ができていきます。中央の下半分を押すと線画の世界に切り替わります。上半分では倍率を切り替えられます。";
   } else if (m.type === "error") {
     note.textContent = "部屋を調べる AI でエラー（" + m.msg + "）";
   } else if (m.type === "scanned") {
@@ -905,7 +909,7 @@ async function scanOnce() {
   try {
     const q = headQ();
     const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
-    const th = CAM_TAN_H / S.zoom, tv = th * vid.videoHeight / vid.videoWidth;
+    const th = CAM_TAN_H / cameraZoomValue(), tv = th * vid.videoHeight / vid.videoWidth;
     const w = SCAN_W, h = Math.round(SCAN_W * vid.videoHeight / vid.videoWidth);
     // shrink on a canvas first: Safari does not always honour createImageBitmap's resize options
     if (!scanShot) scanShot = document.createElement("canvas");
@@ -963,6 +967,7 @@ const WALK_SPEED = 4.5;                 // metres per second (a light run; a wal
 const WALK_ZONE = { w: 0.4, h: 1.0 };   // the touch area: middle 40% of the width, any height
 let pos = [0, 0, 0], walking = 0;
 function inWalkZone(x, y) { return Math.abs(x / VW() - 0.5) < WALK_ZONE.w / 2 && y / VH() < WALK_ZONE.h; }
+function inCameraZoomZone(x, y) { return Math.abs(x / VW() - 0.5) < WALK_ZONE.w / 2 && y / VH() < 0.5; }
 function stepWalk(dt, F) {
   if (!walking) return;
   const l = Math.hypot(F[0], F[2]);
@@ -1039,7 +1044,7 @@ function frame(now) {
   // the goggles' left-right, so it is read turned by the stage's turn. (The PC camera always comes landscape.)
   const vw = src.videoWidth || 4, vh = src.videoHeight || 3;
   const camRot = !pc && ROT && vh > vw ? ROT : 0;
-  const tLong = (pc ? PCCAM_TAN_H : CAM_TAN_H) / S.zoom;      // half-view along the picture's long side
+  const tLong = (pc ? PCCAM_TAN_H : CAM_TAN_H) / cameraZoomValue(); // half-view along the picture's long side
   if (camRot) gl.uniform2f(u.uCamTan, tLong * vw / vh, tLong);
   else gl.uniform2f(u.uCamTan, tLong, tLong * vh / vw);
   gl.uniform1i(u.uCamRot, camRot);
@@ -1455,6 +1460,7 @@ for (const c of CTL) {
   const [minus, , plus] = [row.children[1], row.children[2], row.children[3]];
   const bump = dir => {
     S[c.id] = Math.round(Math.min(c.max, Math.max(c.min, S[c.id] + dir * c.step)) / c.step) * c.step;
+    if (c.id === "zoom") cameraZoomed = false;   // the panel's number wins over the quick ×5
     showVals(); save();
   };
   // one press = one step; holding repeats after 0.4 s, every 0.08 s
@@ -1488,6 +1494,7 @@ function showVals() {
   drawGuide();
 }
 function needsCam() { return S.place === "cam" || S.place === "scan" || S.place === "hands" || (S.me && S.place !== "pccam"); }
+function usesCamera() { return ["cam", "scan", "hands", "pccam"].includes(S.place) || S.me; }
 
 /* ---------- PC camera: wait for the PC page to call, then show what it sends ---------- */
 const pcvid = document.getElementById("pcvid");
@@ -1559,7 +1566,7 @@ function drawGuide() {
 }
 
 for (const b of document.querySelectorAll("#modes div")) b.addEventListener("click", () => {
-  S.place = b.dataset.m; save(); showVals(); syncCam();
+  S.place = b.dataset.m; cameraZoomed = false; save(); showVals(); syncCam();
   pos = [0, 0, 0];                      // a new place: start at its usual spot
 });
 for (const b of document.querySelectorAll("#lstyle div")) b.addEventListener("click", () => { S.lstyle = b.dataset.ls; save(); showVals(); });
@@ -1573,6 +1580,7 @@ for (const b of document.querySelectorAll("#togs div")) b.addEventListener("clic
 // "元に戻す" puts back only the lens and camera-size numbers; the place and switches stay
 document.getElementById("reset").addEventListener("click", () => {
   for (const c of CTL) S[c.id] = DEFAULTS[c.id];
+  cameraZoomed = false;
   showVals(); save();
 });
 showVals();
@@ -1613,6 +1621,11 @@ let drag = null, tapTimer = 0, lastTap = 0;
 const walkers = new Set();
 cv.addEventListener("pointerdown", e => {
   const p = toStage(e);
+  if (window.started && usesCamera() && inCameraZoomZone(p.x, p.y)) {
+    cameraZoomed = !cameraZoomed;
+    hud(true);
+    return;
+  }
   if (window.started && inWalkZone(p.x, p.y)) {
     if (S.place === "scan") { lineMode = !lineMode; hud(true); return; }
     if (S.place === "hands") { resetBubbles(); return; }   // new bubbles around where you face now   // in the room scan, the same spot switches the line world
@@ -1636,7 +1649,7 @@ cv.addEventListener("pointerup", () => {
   const n = performance.now();
   if (n - lastTap < 350) { clearTimeout(tapTimer); lastTap = 0; doRecenter(); return; }
   lastTap = n;
-  tapTimer = setTimeout(() => { panel.classList.remove("off"); drawGuide(); }, 360);
+  tapTimer = setTimeout(() => { cameraZoomed = false; panel.classList.remove("off"); drawGuide(); hud(true); }, 360);
 });
 addEventListener("pointerup", () => { drag = null; });
 </script>
