@@ -28,7 +28,7 @@
 </main>
 <script>
 /* Home-screen apps keep an old copy; load the newest one when its VERSION differs. Bump VERSION on every change. */
-const VERSION = "2026-11-25.2";
+const VERSION = "2026-11-26.1";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -45,6 +45,7 @@ document.addEventListener("visibilitychange", () => { if (document.visibilitySta
    soon: true shows it greyed out without a link. */
 const ITEMS = [
   { path: "vr/", name: "VR　夜の川辺", sub: "ダンボールゴーグルで見回す、雪の降る夜の川（iPhone を横向きに）" },
+  { path: "pccam/", name: "PCカメラ送信", sub: "PC のカメラの映像を VR に送る（VR の「PCカメラ」と使う）" },
 ];
 
 const list = document.getElementById("list");

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PCカメラ送信</title>
+<style>
+  :root { --bg:#0e0f12; --card:#181a20; --line:#2a2d36; --fg:#e8e6e1; --dim:#8b8f99; --acc:#7fb4ff; --ok:#4fd27e; --bad:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:system-ui, -apple-system, "Hiragino Sans", "Yu Gothic UI", sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:28px 16px 40px; }
+  h1 { font-size:24px; margin:0 0 6px; }
+  .lead { color:var(--dim); font-size:14px; line-height:1.7; margin:0 0 18px; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:10px 0; }
+  input, select { background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:10px; padding:10px 12px; font-size:18px; }
+  #code { width:7em; letter-spacing:.2em; font-variant-numeric:tabular-nums; }
+  button { background:var(--acc); color:#0b0b0a; border:0; border-radius:10px; padding:11px 22px; font-size:16px; font-weight:bold; cursor:pointer; }
+  button.sub { background:var(--card); color:var(--fg); border:1px solid var(--line); font-weight:normal; }
+  video { width:100%; border-radius:12px; background:#000; margin-top:10px; aspect-ratio:16/9; }
+  #status { font-size:15px; margin-top:8px; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>PCカメラ送信</h1>
+  <p class="lead">この PC のカメラの映像を、VR（iPhone）に送ります。VR の場所で「PCカメラ」を選ぶと出る 4 けたの番号を入れて「送る」を押してください。映像は PC と iPhone の間で直接やりとりします（つなぐ相手を探すときだけ、PeerJS の無料サーバーを使います）。</p>
+  <div class="row">
+    <label for="code">番号</label><input id="code" inputmode="numeric" maxlength="4" placeholder="1234">
+    <select id="camsel"></select>
+    <button id="go">送る</button><button id="stop" class="sub">止める</button>
+  </div>
+  <div id="status">まだ送っていません</div>
+  <video id="v" playsinline muted autoplay></video>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+"use strict";
+const VERSION = "2026-11-26.1";
+const PEER_PREFIX = "desxus-vr-";      // the VR page's id is this + its 4-digit number
+const RETRY_MS = 3000;                 // when the line drops, call again after this long
+const $ = id => document.getElementById(id);
+let stream = null, peer = null, call = null, want = false, retryTimer = 0;
+function status(t, cls) { $("status").textContent = t; $("status").className = cls || ""; }
+try { $("code").value = localStorage.getItem("pccam-code") || ""; } catch (e) {}
+
+async function listCams() {
+  try {
+    const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === "videoinput");
+    $("camsel").innerHTML = "";
+    devs.forEach((d, i) => { const o = document.createElement("option"); o.value = d.deviceId; o.textContent = d.label || ("カメラ " + (i + 1)); $("camsel").appendChild(o); });
+  } catch (e) {}
+}
+async function openCam() {
+  if (stream) for (const t of stream.getTracks()) t.stop();
+  const id = $("camsel").value;
+  stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: id ? { exact: id } : undefined, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  $("v").srcObject = stream;
+  listCams();
+}
+function dial() {
+  clearTimeout(retryTimer);
+  if (!want) return;
+  const code = $("code").value.trim();
+  status("VR に電話をかけています…（番号 " + code + "）");
+  call = peer.call(PEER_PREFIX + code, stream);
+  if (!call) { retryTimer = setTimeout(dial, RETRY_MS); return; }
+  call.on("stream", () => {});
+  // PeerJS has no "answered" event for the caller; watch the connection itself
+  const pc = call.peerConnection;
+  if (pc) pc.addEventListener("connectionstatechange", () => {
+    if (pc.connectionState === "connected") status("送っています（番号 " + code + "）", "ok");
+    if (["failed", "disconnected", "closed"].includes(pc.connectionState) && want) {
+      status("切れました。つなぎ直します…", "bad"); retryTimer = setTimeout(dial, RETRY_MS);
+    }
+  });
+  call.on("close", () => { if (want) { status("切れました。つなぎ直します…", "bad"); retryTimer = setTimeout(dial, RETRY_MS); } });
+}
+$("go").onclick = async () => {
+  const code = $("code").value.trim();
+  if (!/^\d{4}$/.test(code)) { status("4 けたの番号を入れてください", "bad"); return; }
+  try { localStorage.setItem("pccam-code", code); } catch (e) {}
+  try { await openCam(); } catch (e) { status("カメラを開けませんでした（" + (e.name || e) + "）", "bad"); return; }
+  want = true;
+  if (peer && !peer.destroyed) { dial(); return; }
+  peer = new Peer();
+  peer.on("open", dial);
+  peer.on("error", e => {
+    if (e.type === "peer-unavailable") { status("その番号の VR が見つかりません。VR で「PCカメラ」を開いているか確かめてください。待ちながらかけ直します…", "bad"); retryTimer = setTimeout(dial, RETRY_MS); }
+    else status("エラー（" + e.type + "）", "bad");
+  });
+};
+$("stop").onclick = () => {
+  want = false; clearTimeout(retryTimer);
+  if (call) call.close();
+  if (stream) for (const t of stream.getTracks()) t.stop();
+  stream = null; $("v").srcObject = null;
+  status("止めました");
+};
+listCams();
+</script>
+</body>
+</html>
