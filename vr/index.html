@@ -40,11 +40,11 @@
 <video id="vid" playsinline muted autoplay></video>
 <div id="panel">
   <b>VR</b>
-  <div class="s">黄色い十字が、それぞれのレンズの真ん中に来るように合わせてください（押し続けると連続で動きます）。<br>ゴーグルの中で：画面の<b style="font-size:12px">中央の上の方を押している間 → 向いている方へ歩く</b>／ほかを1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
+  <div class="s">黄色い十字が、それぞれのレンズの真ん中に来るように合わせてください（押し続けると連続で動きます）。<br>ゴーグルの中で：画面の<b style="font-size:12px">真ん中を押している間 → 向いている方へ歩く</b>／ほかを1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
   <div class="modes" id="modes"><div data-m="river">夜の川辺</div><div data-m="sunset">夕焼けの海</div><div data-m="meadow">昼の草原</div><div data-m="space">宇宙</div><div data-m="cam">カメラ</div><div data-m="scan">部屋スキャン</div></div>
   <div class="modes" id="togs"><div data-t="snow">雪</div><div data-t="me">自分を映す</div></div>
   <div id="ctl"></div>
-  <div class="s" id="scanhelp" style="display:none">部屋スキャン：画面の中央の上を押すと「線画」（カメラに写る物の輪郭を白、ほかを黒）に切り替わり、もう一度押すとカメラに戻ります。<span id="scanclear" style="display:none"></span></div>
+  <div class="s" id="scanhelp" style="display:none">部屋スキャン：画面の真ん中を押すと「線画」（カメラに写る物の輪郭を白、ほかを黒）に切り替わり、もう一度押すとカメラに戻ります。<span id="scanclear" style="display:none"></span></div>
   <div class="btns"><div id="reset">元に戻す</div><div id="go">はじめる</div></div>
   <div class="s" id="note"></div>
   <div class="s" id="ver" style="text-align:right;margin:0"></div>
@@ -53,7 +53,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.7";
+const VERSION = "2026-11-26.8";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -859,7 +859,7 @@ for (let i = 0; i < SNOW_N; i++) flakes.push({ x: rnd(-14, 14), y: rnd(-EYE_HEIG
 let T = 0;
 /* ---------- walking: while the top-middle of the screen is held, move the way you face ---------- */
 const WALK_SPEED = 4.5;                 // metres per second (a light run; a walk is 1.4)
-const WALK_ZONE = { w: 0.4, h: 0.35 };  // the touch area: middle 40% of the width, top 35% of the height
+const WALK_ZONE = { w: 0.4, h: 1.0 };   // the touch area: middle 40% of the width, any height
 let pos = [0, 0, 0], walking = 0;
 function inWalkZone(x, y) { return Math.abs(x / innerWidth - 0.5) < WALK_ZONE.w / 2 && y / innerHeight < WALK_ZONE.h; }
 function stepWalk(dt, F) {
