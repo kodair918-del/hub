@@ -59,7 +59,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.14";
+const VERSION = "2026-11-26.15";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -180,6 +180,17 @@ function onOrient(e) {
   q = qMul(q, Q_BACK);
   const ang = (ROT || screenAng()) * d;   // with the stage turned, the phone sits the stage's way round
   devQ = qMul(q, qAxis(0, 0, 1, -ang));
+}
+// the head's turn over the last half second, to look up where it was when the camera took its picture
+const headHist = [];
+function remember(q) {
+  const t = performance.now(); headHist.push([t, q]);
+  while (headHist.length && t - headHist[0][0] > 500) headHist.shift();
+}
+function headQAt(t) {
+  let best = headHist.length ? headHist[headHist.length - 1][1] : headQ();
+  for (let i = headHist.length - 1; i >= 0; i--) { best = headHist[i][1]; if (headHist[i][0] <= t) break; }
+  return best;
 }
 function headQ() {
   if (hasGyro && devQ) return qMul(recenter, devQ);
@@ -1014,7 +1025,13 @@ function frame(now) {
     for (const side of [-1, 1]) { gl.uniform1f(v.uSide, side); gl.drawArrays(gl.POINTS, 0, SNOW_N); }
   }
   gl.bindVertexArray(null);
-  if (S.place === "hands" && window.started) { if (!bubbles.length) resetBubbles(); stepAR(dt, R, U, F); drawAR(R, U, F); }
+  remember(q);
+  if (S.place === "hands" && window.started) {
+    if (!bubbles.length) resetBubbles();
+    // everything AR is placed for the head as it was when the camera picture was taken
+    const qa = headQAt(now - AR_LAG_MS), Ra = qRot(qa, 1, 0, 0), Ua = qRot(qa, 0, 1, 0), Fa = qRot(qa, 0, 0, -1);
+    stepAR(dt, Ra, Ua, Fa); drawAR(Ra, Ua, Fa);
+  }
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
@@ -1025,8 +1042,10 @@ requestAnimationFrame(frame);
    bubble whose direction is close enough to it pops. Only the head's turn is known (no position), so the
    bubbles stay where they are while you look around on the spot. */
 const BUB_N = 10;              // bubbles floating at once
-const BUB_DIST = [0.55, 0.85]; // how far away (metres): about an arm's reach
-const BUB_SIZE = [0.07, 0.12]; // bubble diameter (metres)
+const BUB_DIST = 0.8;          // how far away (metres): all the same, so they all look the same size
+const BUB_SIZE = 0.11;         // bubble diameter (metres)
+const AR_LAG_MS = 70;          // the camera picture arrives this late; bubbles are drawn for the head as it was
+                               // then, so they stay put on the room instead of sliding as you turn
 const BUB_SPREAD = 70;         // left/right spread around where you faced at the start (degrees)
 const BUB_HIT = 1.25;          // how generous a touch is (1 = exactly the bubble's edge)
 const BUB_RESPAWN_MS = 1200;   // a popped bubble comes back after this long, somewhere else
@@ -1039,10 +1058,10 @@ const bubbles = [], sparks = [];
 let arYaw = 0;                                   // the direction you faced when the AR started
 function rand(a, b) { return a + Math.random() * (b - a); }
 function newBubble(b) {
-  const yaw = arYaw + rand(-BUB_SPREAD, BUB_SPREAD) * PI / 180, pitch = rand(-12, 30) * PI / 180, d = rand(BUB_DIST[0], BUB_DIST[1]);
+  const yaw = arYaw + rand(-BUB_SPREAD, BUB_SPREAD) * PI / 180, pitch = rand(-12, 30) * PI / 180, d = BUB_DIST;
   b = b || {};
   b.base = [-Math.sin(yaw) * Math.cos(pitch) * d, Math.sin(pitch) * d, -Math.cos(yaw) * Math.cos(pitch) * d];
-  b.size = rand(BUB_SIZE[0], BUB_SIZE[1]); b.ph = rand(0, 6.28); b.dead = 0; b.p = b.base.slice();
+  b.size = BUB_SIZE; b.ph = rand(0, 6.28); b.dead = 0; b.p = b.base.slice();
   return b;
 }
 function resetBubbles() {
@@ -1176,6 +1195,9 @@ function drawAR(R, U, F) {
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
   gl.useProgram(PA.p); const v = PA.u;
   setLens(v);
+  // no left/right shift: the camera picture is the same for both eyes (it looks far away), so bubbles drawn
+  // with a shift floated in front of it like stickers. Without it they sit in the room like the picture does.
+  gl.uniform1f(v.uOff, 0);
   gl.uniform3f(v.uR, ...R); gl.uniform3f(v.uU, ...U); gl.uniform3f(v.uF, ...F);
   gl.uniform1f(v.uPxMm, cv.width / mmW);
   gl.bindVertexArray(vaoAR);
