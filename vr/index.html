@@ -59,7 +59,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.15";
+const VERSION = "2026-11-26.16";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -167,7 +167,7 @@ function toStage(e) {
 }
 
 /* ---------- head orientation ---------- */
-let devQ = null, hasGyro = false;
+let devQ = null, hasGyro = false, devBodyQ = null;
 let recenter = [0, 0, 0, 1];
 let dragYaw = 0, dragPitch = 0;
 const Q_BACK = [-Math.SQRT1_2, 0, 0, Math.SQRT1_2];   // -90 deg about X: the camera looks out of the back of the phone
@@ -178,6 +178,7 @@ function onOrient(e) {
   const c1 = Math.cos(x/2), c2 = Math.cos(y/2), c3 = Math.cos(z/2), s1 = Math.sin(x/2), s2 = Math.sin(y/2), s3 = Math.sin(z/2);
   let q = [s1*c2*c3 + c1*s2*s3, c1*s2*c3 - s1*c2*s3, c1*c2*s3 - s1*s2*c3, c1*c2*c3 + s1*s2*s3];   // Euler YXZ
   q = qMul(q, Q_BACK);
+  devBodyQ = q;   // the phone itself (its own x right / y top / z out of the screen) -> world
   const ang = (ROT || screenAng()) * d;   // with the stage turned, the phone sits the stage's way round
   devQ = qMul(q, qAxis(0, 0, 1, -ang));
 }
@@ -1030,11 +1031,40 @@ function frame(now) {
     if (!bubbles.length) resetBubbles();
     // everything AR is placed for the head as it was when the camera picture was taken
     const qa = headQAt(now - AR_LAG_MS), Ra = qRot(qa, 1, 0, 0), Ua = qRot(qa, 0, 1, 0), Fa = qRot(qa, 0, 0, -1);
-    stepAR(dt, Ra, Ua, Fa); drawAR(Ra, Ua, Fa);
+    const H = eyePos(qa);
+    stepAR(dt, Ra, Ua, Fa, H); drawAR(Ra, Ua, Fa, H);
   }
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
+
+/* ---------- where the head is (not just which way it faces), for AR ----------
+   1) The neck: turning the head swings the eyes around the neck, ~10 cm below and ~8 cm behind them.
+   2) The accelerometer: its push is added up twice into a movement. Added-up sensor noise grows without
+      end (after a few seconds it would be metres off), so both the speed and the movement are pulled back
+      toward zero all the time: quick leans and steps show, and when you stay still it settles back. */
+const NECK = [0, 0.10, -0.08];   // eyes relative to the neck pivot when facing ahead (metres: up, forward)
+const MOTION_DEAD = 0.12;        // pushes weaker than this (m/s^2) are sensor noise
+const MOTION_TAU_V = 0.45;       // seconds for the speed to fade by ~63%
+const MOTION_TAU_P = 1.6;        // seconds for the movement to return by ~63% toward where you started
+const MOTION_MAX = 0.35;         // never more than this far from the start (metres)
+let bodyV = [0, 0, 0], bodyP = [0, 0, 0], lastMotionT = 0;
+function onMotion(e) {
+  const a = e.acceleration;
+  if (!a || a.x == null || !devBodyQ) return;
+  const t = performance.now(), dt = lastMotionT ? Math.min(0.05, (t - lastMotionT) / 1000) : 0; lastMotionT = t;
+  if (!dt) return;
+  let w = qRot(qMul(recenter, devBodyQ), a.x, a.y, a.z);   // the push in room directions
+  if (Math.hypot(...w) < MOTION_DEAD) w = [0, 0, 0];
+  const kv = Math.exp(-dt / MOTION_TAU_V), kp = Math.exp(-dt / MOTION_TAU_P);
+  for (let i = 0; i < 3; i++) { bodyV[i] = (bodyV[i] + w[i] * dt) * kv; bodyP[i] = (bodyP[i] + bodyV[i] * dt) * kp; }
+  const l = Math.hypot(...bodyP); if (l > MOTION_MAX) for (let i = 0; i < 3; i++) bodyP[i] *= MOTION_MAX / l;
+}
+// the eyes' place in the room for a head turned by q
+function eyePos(q) {
+  const n = qRot(q, NECK[0], NECK[1], NECK[2]);
+  return [bodyP[0] + n[0] - NECK[0], bodyP[1] + n[1] - NECK[1], bodyP[2] + n[2] - NECK[2]];
+}
 
 /* ---------- AR "手で遊ぶ": soap bubbles float in your room; touch them with a fingertip to pop them ----------
    The camera shows the room. MediaPipe's hand model finds the index fingertip in the camera picture; that
@@ -1060,7 +1090,8 @@ function rand(a, b) { return a + Math.random() * (b - a); }
 function newBubble(b) {
   const yaw = arYaw + rand(-BUB_SPREAD, BUB_SPREAD) * PI / 180, pitch = rand(-12, 30) * PI / 180, d = BUB_DIST;
   b = b || {};
-  b.base = [-Math.sin(yaw) * Math.cos(pitch) * d, Math.sin(pitch) * d, -Math.cos(yaw) * Math.cos(pitch) * d];
+  const h = eyePos(headQ());
+  b.base = [h[0] - Math.sin(yaw) * Math.cos(pitch) * d, h[1] + Math.sin(pitch) * d, h[2] - Math.cos(yaw) * Math.cos(pitch) * d];
   b.size = BUB_SIZE; b.ph = rand(0, 6.28); b.dead = 0; b.p = b.base.slice();
   return b;
 }
@@ -1111,7 +1142,7 @@ function popSound() {
     o.connect(g).connect(actx.destination); o.start(t); o.stop(t + 0.13);
   } catch (e) {}
 }
-function stepAR(dt, R, U, F) {
+function stepAR(dt, R, U, F, H) {
   findFingers(R, U, F);
   const now = performance.now();
   for (const b of bubbles) {
@@ -1119,7 +1150,8 @@ function stepAR(dt, R, U, F) {
     // drift: a slow bob and sway
     b.p[0] = b.base[0] + Math.sin(T * 0.6 + b.ph) * 0.03; b.p[1] = b.base[1] + Math.sin(T * 0.9 + b.ph * 2) * 0.04;
     b.p[2] = b.base[2] + Math.cos(T * 0.5 + b.ph) * 0.03;
-    const d = Math.hypot(...b.p), dir = [b.p[0] / d, b.p[1] / d, b.p[2] / d], ang = Math.atan(b.size / 2 / d) * BUB_HIT;
+    const rel = [b.p[0] - H[0], b.p[1] - H[1], b.p[2] - H[2]];
+    const d = Math.hypot(...rel), dir = [rel[0] / d, rel[1] / d, rel[2] / d], ang = Math.atan(b.size / 2 / d) * BUB_HIT;
     for (const f of fingers) {
       if (Math.acos(Math.min(1, dir[0] * f[0] + dir[1] * f[1] + dir[2] * f[2])) < ang) {
         b.dead = now; popped++; popSound(); hud(true);
@@ -1185,11 +1217,12 @@ gl.bufferData(gl.ARRAY_BUFFER, arData.byteLength, gl.DYNAMIC_DRAW);
   gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, n, gl.FLOAT, false, 24, off);
 });
 gl.bindVertexArray(null);
-function drawAR(R, U, F) {
+function drawAR(R, U, F, H) {
   let n = 0;
   const put = (p, s, k, a) => { if (n >= AR_MAX) return; arData.set([p[0], p[1], p[2], s, k, a], n * 6); n++; };
-  for (const b of bubbles) if (!b.dead) put(b.p, b.size, 0, 1);
-  for (const s of sparks) put(s.p, 0.012, 1, 1 - s.t / 0.6);
+  const rel = p => [p[0] - H[0], p[1] - H[1], p[2] - H[2]];   // drawn from where the eyes are now
+  for (const b of bubbles) if (!b.dead) put(rel(b.p), b.size, 0, 1);
+  for (const s of sparks) put(rel(s.p), 0.012, 1, 1 - s.t / 0.6);
   for (const f of fingers) put([f[0] * 0.6, f[1] * 0.6, f[2] * 0.6], 0.04, 2, 0.9);
   if (!n) return;
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
@@ -1351,7 +1384,11 @@ document.getElementById("go").addEventListener("click", async () => {
         if (r !== "granted") document.getElementById("note").textContent = "首の動きが許可されませんでした。指でドラッグして見回せます。";
       }
     } catch (e) {}
+    try {
+      if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") await DeviceMotionEvent.requestPermission();
+    } catch (e) {}
     addEventListener("deviceorientation", onOrient);
+    addEventListener("devicemotion", onMotion);
     keepAwake();
     if (needsCam() && !(await syncCam())) return;
     window.started = true;
