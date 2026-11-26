@@ -31,6 +31,9 @@
   .modes div { flex:1 1 84px; text-align:center; padding:8px 0; border-radius:10px; background:#252832; font-size:13px; }
   .modes div.on { background:#7fb4ff; color:#0b0b0a; font-weight:bold; }
   #togs div { flex:0 0 auto; padding:8px 16px; }
+  .lab { font-size:12px; color:#9aa0ab; margin:10px 0 2px; letter-spacing:.04em; }
+  .lab .new { color:#0b0b0a; background:#ffd84a; border-radius:6px; padding:1px 6px; font-size:11px; margin-left:4px; }
+  #lfocus { flex:0 0 auto; padding:8px 34px !important; }
   /* the square the "what is this" mode looks at, drawn over each lens */
   .whatbox { position:absolute; z-index:3; display:none; border:2px dashed rgba(127,180,255,.9); border-radius:12px; pointer-events:none; }
   #togs div.on::before { content:"✓ "; }
@@ -56,8 +59,14 @@
   <div class="s" id="asciihelp" style="display:none">アスキーアート：カメラの映像を文字（. : - = + * # % @）で描きます。明るいほど濃い文字になります。中央の上半分を押すと×5に寄れ、寄るほど細かい文字になります。</div>
   <div class="s" id="whathelp" style="display:none">なにこれ？：画面の真ん中（青い枠の中）に映っているものを当てます。マグカップ・財布・スマホ・本など。0.8秒ごとに見直すので、枠の中に入れて少し待ってください。<span id="whatstate"></span></div>
   <div id="lineopts" style="display:none">
-    <div class="modes" id="lstyle"><div data-ls="simple">シンプル</div><div data-ls="neon">ネオン</div><div data-ls="sketch">手描き</div></div>
+    <div class="lab">見た目</div>
+    <div class="modes" id="lstyle"><div data-ls="simple">シンプル</div><div data-ls="neon">ネオン</div><div data-ls="sketch">手書き</div></div>
+    <div class="lab" id="lcollab">色</div>
     <div class="modes" id="lcol"><div data-lc="white">白</div><div data-lc="cyan">水色</div><div data-lc="green">緑</div><div data-lc="pink">ピンク</div></div>
+    <div class="lab">フォーカスモード <b class="new">new!</b></div>
+    <div class="s">オンにすると、線画のまま目の前（真ん中）のものだけに色が付きます。輪郭で囲まれた中だけを塗ります。</div>
+    <div class="modes"><div id="lfocus" data-f="1">OFF</div></div>
+    <div class="lab">ほか</div>
     <div class="modes"><div id="lkeep">線を部屋に残す</div><div id="lclear">残した線を消す</div></div>
   </div>
   <div class="btns"><div id="reset">元に戻す</div><div id="go">はじめる</div></div>
@@ -69,7 +78,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.21";
+const VERSION = "2026-11-26.22";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -99,7 +108,7 @@ const CAM_TAN_H = Math.tan(34 * Math.PI / 180);   // half of the 1x camera's hor
 // sep: lens spacing (mm), vy: lens centre up/down (mm), k: distortion scale, dist: screen-to-lens (mm),
 // zoom: camera picture size (1 = true size), place: river | sunset | meadow | space | cam,
 // snow: snowflakes on/off, me: cut the body out of the camera picture and put it in the place
-const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39, zoom: 1, place: "river", snow: true, me: false, flip: false, lstyle: "simple", lcol: "white", lkeep: true };
+const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39, zoom: 1, place: "river", snow: true, me: false, flip: false, lstyle: "simple", lcol: "white", lkeep: true, focus: false };
 const PLACES = ["river", "sunset", "meadow", "space", "cam", "scan", "ascii", "what", "pccam", "hands"];
 // PC camera: the PC's webcam comes in over WebRTC (PeerJS finds the PC; the video goes directly between the two)
 const PEER_PREFIX = "desxus-vr-";   // this page's id = prefix + a 4-digit number the PC page types in
@@ -309,6 +318,8 @@ uniform vec2 uCamTexel;
 uniform sampler2D uAsciiTex, uGlyphTex;   // the ASCII mode: cell brightness, and the characters' shapes
 uniform vec2 uAsciiN;                     // characters across / down the camera picture
 uniform float uCharN;                     // characters in the atlas
+uniform sampler2D uFocusTex;              // focus mode: 1 inside the outline of what is in front of you
+uniform float uFocus;
 out vec4 o;
 const float PI = 3.14159265, DEG = PI / 180.0;
 
@@ -600,6 +611,11 @@ void main() {
     bool camIn = uCamOk > 0.5 && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
     vec3 col = camIn ? texture(uCam, uv).rgb : vec3(0);
     if (uLines > 0.5) col = lineWorld(normalize(uF + uR * tu.x + uU * tu.y), uv, camIn);
+    // focus mode: inside the outline of the thing in front, the picture keeps its own colours
+    if (uFocus > 0.5 && uLines > 0.5 && camIn) {
+      float f = smoothstep(0.05, 0.6, texture(uFocusTex, uv).r);
+      if (f > 0.001) col = mix(col, texture(uCam, uv).rgb, f * 0.9);
+    }
     o = vec4(col, 1.0);
     return;
   }
@@ -1141,6 +1157,7 @@ function frame(now) {
   const [tanX, tanY] = camViewTan(vw, vh, camRot, cam);
   camRotNow = camRot; camTanNow = [tanX, tanY];
   if (S.place === "scan" && camOk && !pc) linePasses(now);
+  if (S.place === "scan" && camOk && !pc && S.focus && lineMode) focusPasses(now); else focusOk = 0;
   if (S.place === "ascii" && camOk && !pc) asciiPasses();
   gl.useProgram(P.p); const u = P.u;
   setLens(u);
@@ -1158,6 +1175,7 @@ function frame(now) {
   gl.uniform1i(u.uMask, 1); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, maskTex);
   gl.uniform1f(u.uEdge, EDGE_ANGLE); gl.uniform1f(u.uCeilH, CEIL_H);
   gl.uniform1f(u.uLineW, LINE_WIDTH); gl.uniform1f(u.uLineLo, LINE_LO); gl.uniform1f(u.uLineHi, LINE_HI);
+  gl.uniform1f(u.uFocus, S.focus && focusOk ? 1 : 0);
   setScanUniforms(u);
   setLineUniforms(u);
   setAsciiUniforms(u);
@@ -1711,9 +1729,127 @@ function linePasses(now) {
 function setLineUniforms(u) {
   gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, edgeT ? edgeT.tex : maskTex); gl.uniform1i(u.uEdgeTex, 4);
   gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, lmapT ? lmapT.tex : maskTex); gl.uniform1i(u.uWorldL, 5);
+  gl.activeTexture(gl.TEXTURE8); gl.bindTexture(gl.TEXTURE_2D, focusT || maskTex); gl.uniform1i(u.uFocusTex, 8);
   gl.uniform1i(u.uLStyle, { simple: 0, neon: 1, sketch: 2 }[S.lstyle] || 0);
   gl.uniform3f(u.uLCol, ...(LINE_COLORS[S.lcol] || LINE_COLORS.white));
   gl.uniform1f(u.uLKeep, S.lkeep && lmapT ? 1 : 0);
+}
+
+/* ---------- focus mode: colour only the thing in front of you ----------
+   The line picture's edges are the outlines; the middle of the picture is filled like a paint bucket
+   (a flood fill that stops at those outlines and at big brightness changes), so whatever the outline
+   encloses gets its own colours back, and nothing outside it does. The fill runs on a small copy of the
+   line picture and its result is smoothed a little over time, so the edge does not crawl. */
+const FOCUS_W = 192;            // the mask's width (a small grid is enough for the fill)
+const FOCUS_GAP_MS = 110;       // how often the fill is redone
+const FOCUS_BARRIER = 40;       // a line stronger than this (0..255) stops the fill
+const FOCUS_TOL = 26;           // how much brighter / darker than the middle a pixel may be and still fill
+const FOCUS_MAX = 0.55;         // a fill larger than this part of the picture has leaked: let it go
+const FS_FSRC = `#version 300 es
+precision highp float;
+uniform sampler2D uEdge; uniform vec2 uSize;
+out vec4 o;
+void main() { o = texture(uEdge, gl_FragCoord.xy / uSize); }`;
+const PFS = prog(VS_FULL, FS_FSRC);
+let fsT = null, fsBuf = null, focusT = null, focusPrev = null, focusCur = null, focusSeen = null,
+    focusStack = null, focusTmp = null, lastFocus = -1e9, focusOk = 0;
+function focusPasses(now) {
+  if (!S.focus || S.place !== "scan" || !edgeT) { focusOk = 0; return; }
+  if (now - lastFocus < FOCUS_GAP_MS) return;
+  lastFocus = now;
+  const vw = vid.videoWidth || 4, vh = vid.videoHeight || 3;
+  const fw = FOCUS_W, fh = Math.max(24, Math.round(FOCUS_W * vh / vw)), n = fw * fh;
+  if (!fsT || fsT.w !== fw || fsT.h !== fh) {
+    fsT = makeTarget(fw, fh, gl.NEAREST);
+    fsBuf = new Uint8Array(n * 4);
+    focusPrev = new Uint8Array(n); focusCur = new Uint8Array(n); focusTmp = new Uint8Array(n);
+    focusSeen = new Uint8Array(n); focusStack = new Int32Array(n);
+    if (focusT) gl.deleteTexture(focusT);
+    focusT = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, focusT);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, fw, fh, 0, gl.RED, gl.UNSIGNED_BYTE, focusPrev);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+  // the line picture's edges and brightness, small, ready to be read back
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fsT.fb); gl.viewport(0, 0, fw, fh); gl.disable(gl.BLEND);
+  gl.useProgram(PFS.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, edgeT.tex); gl.uniform1i(PFS.u.uEdge, 0);
+  gl.uniform2f(PFS.u.uSize, fw, fh);
+  gl.bindVertexArray(vaoFull); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.readPixels(0, 0, fw, fh, gl.RGBA, gl.UNSIGNED_BYTE, fsBuf);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, cv.width, cv.height);
+  // fill from the middle, out to the outlines
+  const sx = fw >> 1, sy = fh >> 1, seed = sy * fw + sx, seedB = fsBuf[seed * 4 + 1];
+  focusCur.fill(0); focusSeen.fill(0);
+  let top = 0, count = 0, hitMax = false;
+  focusStack[top++] = seed; focusSeen[seed] = 1;
+  const maxFill = Math.floor(n * FOCUS_MAX);
+  while (top > 0) {
+    const i = focusStack[--top];
+    focusCur[i] = 255; count++;
+    if (count > maxFill) { hitMax = true; break; }
+    const x = i % fw, y = (i - x) / fw;
+    for (let k = 0; k < 4; k++) {
+      const nx = x + (k === 0 ? -1 : k === 1 ? 1 : 0), ny = y + (k === 2 ? -1 : k === 3 ? 1 : 0);
+      if (nx < 0 || ny < 0 || nx >= fw || ny >= fh) continue;
+      const j = ny * fw + nx;
+      if (focusSeen[j]) continue;
+      focusSeen[j] = 1;
+      if (fsBuf[j * 4] > FOCUS_BARRIER) continue;                    // an outline: stop here
+      if (Math.abs(fsBuf[j * 4 + 1] - seedB) > FOCUS_TOL) continue;  // a different thing
+      focusStack[top++] = j;
+    }
+  }
+  // a leaked fill (the outline had a gap) keeps the last good one instead
+  if (hitMax) focusCur.set(focusPrev);
+  else {
+    // holes: empty places fully circled by the fill (the inside of a cup's handle, the gap in a ring)
+    // are part of the thing, so they get colours too. Only small ones: the room behind is much bigger.
+    focusSeen.fill(0); top = 0;
+    const push = i => { if (!focusSeen[i] && !focusCur[i]) { focusSeen[i] = 1; focusStack[top++] = i; } };
+    for (let x = 0; x < fw; x++) { push(x); push((fh - 1) * fw + x); }
+    for (let y = 0; y < fh; y++) { push(y * fw); push(y * fw + fw - 1); }
+    while (top > 0) {                                  // everything the border can reach is the room
+      const i = focusStack[--top], x = i % fw, y = (i - x) / fw;
+      if (x > 0) push(i - 1); if (x < fw - 1) push(i + 1);
+      if (y > 0) push(i - fw); if (y < fh - 1) push(i + fw);
+    }
+    const holeMax = Math.max(24, Math.floor(count * 0.5));
+    for (let i = 0; i < n; i++) {
+      if (focusSeen[i] || focusCur[i]) continue;
+      let holeTop = 0; focusStack[holeTop++] = i; focusSeen[i] = 1;
+      const cells = [i];
+      while (holeTop > 0) {
+        const j = focusStack[--holeTop], x = j % fw, y = (j - x) / fw;
+        for (const k of [-1, 1, -fw, fw]) {
+          const jj = j + k;
+          if (jj < 0 || jj >= n || (k === -1 && x === 0) || (k === 1 && x === fw - 1)) continue;
+          if (focusSeen[jj] || focusCur[jj]) continue;
+          focusSeen[jj] = 1; focusStack[holeTop++] = jj; cells.push(jj);
+        }
+      }
+      if (cells.length <= holeMax) for (const j of cells) focusCur[j] = 255;
+    }
+  }
+  // smooth over time, and soften the mask's own edge so the colour fades in at the outline
+  for (let i = 0; i < n; i++) focusPrev[i] = (focusPrev[i] * 3 + focusCur[i]) >> 2;
+  for (let y = 0; y < fh; y++) for (let x = 0; x < fw; x++) {
+    const i = y * fw + x;
+    let s = 0, c = 0;
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= fw || ny >= fh) continue;
+      s += focusPrev[ny * fw + nx]; c++;
+    }
+    focusTmp[i] = s / c;
+  }
+  gl.bindTexture(gl.TEXTURE_2D, focusT);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, fw, fh, gl.RED, gl.UNSIGNED_BYTE, focusTmp);
+  focusOk = 1;
 }
 
 /* ---------- the adjust panel ---------- */
@@ -1763,6 +1899,10 @@ function showVals() {
   for (const b of document.querySelectorAll("#lstyle div")) b.classList.toggle("on", b.dataset.ls === S.lstyle);
   for (const b of document.querySelectorAll("#lcol div")) b.classList.toggle("on", b.dataset.lc === S.lcol);
   document.getElementById("lcol").style.display = S.lstyle === "sketch" ? "none" : "";
+  document.getElementById("lcollab").style.display = S.lstyle === "sketch" ? "none" : "";
+  const lf = document.getElementById("lfocus");
+  lf.textContent = S.focus ? "ON" : "OFF";
+  lf.classList.toggle("on", !!S.focus);
   document.getElementById("lkeep").classList.toggle("on", !!S.lkeep);
   document.getElementById("pccamhelp").style.display = S.place === "pccam" ? "" : "none";
   document.getElementById("pccode").textContent = pcCode();
@@ -1848,6 +1988,7 @@ for (const b of document.querySelectorAll("#modes div")) b.addEventListener("cli
 });
 for (const b of document.querySelectorAll("#lstyle div")) b.addEventListener("click", () => { S.lstyle = b.dataset.ls; save(); showVals(); });
 for (const b of document.querySelectorAll("#lcol div")) b.addEventListener("click", () => { S.lcol = b.dataset.lc; save(); showVals(); });
+document.getElementById("lfocus").addEventListener("click", () => { S.focus = !S.focus; lastFocus = -1e9; save(); showVals(); });
 document.getElementById("lkeep").addEventListener("click", () => { S.lkeep = !S.lkeep; save(); showVals(); });
 document.getElementById("lclear").addEventListener("click", () => { clearLines(); document.getElementById("note").textContent = "残した線を消しました。"; });
 document.getElementById("scanclear").addEventListener("click", () => { clearScans(); document.getElementById("note").textContent = "部屋の地図を消しました。"; });
