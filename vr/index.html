@@ -42,7 +42,7 @@
   <div class="modes" id="modes"><div data-m="river">夜の川辺</div><div data-m="sunset">夕焼けの海</div><div data-m="meadow">昼の草原</div><div data-m="space">宇宙</div><div data-m="cam">カメラ</div><div data-m="scan">部屋スキャン</div></div>
   <div class="modes" id="togs"><div data-t="snow">雪</div><div data-t="me">自分を映す</div></div>
   <div id="ctl"></div>
-  <div class="s" id="scanhelp" style="display:none">部屋スキャン：画面の中央の上の方を押すと、そのとき見ている所を AI が調べて、<span style="color:#6fa2ff">壁</span>・<span style="color:#4fd27e">床</span>・<span style="color:#ffd84a">天井</span>・<span style="color:#ff9a3c">窓とドア</span>・<span style="color:#ff5c7c">人</span>・ほかの物（名前つき）に色を塗ります。首を回しても塗った所は部屋に残り、最大 4 回分まで重なります。<span id="scanclear" style="text-decoration:underline">塗った色を消す</span></div>
+  <div class="s" id="scanhelp" style="display:none">部屋スキャン：見ている方向を AI がずっと調べ続け、部屋の地図を作っていきます。画面の中央の上を押すと「線画の世界」に切り替わり、もう一度押すとカメラに戻ります。線の色：<span style="color:#6fa2ff">壁</span>・<span style="color:#4fd27e">床</span>・<span style="color:#ffd84a">天井</span>・<span style="color:#ff9a3c">窓とドア</span>・<span style="color:#ff5c7c">人</span>・ほかの物。<span id="scanclear" style="text-decoration:underline">地図を消す</span></div>
   <div class="btns"><div id="reset">元に戻す</div><div id="go">はじめる</div></div>
   <div class="s" id="note"></div>
   <div class="s" id="ver" style="text-align:right;margin:0"></div>
@@ -51,7 +51,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.1";
+const VERSION = "2026-11-26.2";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -87,9 +87,10 @@ const PLACES = ["river", "sunset", "meadow", "space", "cam", "scan"];
 const TF_VER = "3.0.2";
 const SCAN_MODEL = "Xenova/segformer-b0-finetuned-ade-512-512";
 const SCAN_W = 448;          // the camera picture is shrunk to this width before the AI looks at it
-const MAX_SCANS = 4;         // how many scans stay painted on the room
-const SCAN_ALPHA = 0.45;     // how strongly the colours cover the room (a fresh scan flashes brighter)
-const SCAN_MIN_SHARE = 0.015;  // a thing must cover at least this much of the picture to get a name tag
+const SCAN_GAP_MS = 250;     // pause between scans (scanning never stops while the room scan is open)
+const WORLD_W = 2048, WORLD_H = 1024;   // the room map: one label per direction (0.18 deg per map pixel)
+const EDGE_ANGLE = 0.006;    // how far apart (radians) two directions must disagree to draw a line there
+const CEIL_H = 0.9;          // ceiling height above the eyes, metres (for its grid); the floor uses EYE_HEIGHT
 let S = Object.assign({}, DEFAULTS);
 try { Object.assign(S, JSON.parse(localStorage.getItem("vrcfg") || "{}")); } catch (e) {}
 if (S.mode) {   // settings saved by the older page
@@ -161,25 +162,51 @@ uniform vec2 uSegTh;
 uniform vec3 uR, uU, uF, uPos;
 uniform int uMode, uScene;
 uniform sampler2D uCam, uMask;
-uniform sampler2D uScan0, uScan1, uScan2, uScan3;
-uniform vec3 uScanR[4], uScanU[4], uScanF[4];
-uniform vec2 uScanTan[4];
-uniform float uScanA[4];
-uniform int uScanN;
-uniform float uBusy;
+uniform sampler2D uWorld, uPal;
+uniform float uLines, uFloorId, uCeilId, uEdge, uCeilH;
+uniform vec2 uCamTexel;
 out vec4 o;
 const float PI = 3.14159265, DEG = PI / 180.0;
 
-// a scan is a coloured picture taken while the head faced a certain way: look the ray up in it
-vec4 scanAt(sampler2D s, int i, vec3 d) {
-  float cz = dot(d, uScanF[i]);
-  if (cz <= 0.05) return vec4(0);
-  vec2 t = vec2(dot(d, uScanR[i]), dot(d, uScanU[i])) / cz;
-  vec2 uv = vec2(0.5 + t.x / (2.0 * uScanTan[i].x), 0.5 - t.y / (2.0 * uScanTan[i].y));
-  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return vec4(0);
-  vec4 c = texture(s, uv);
-  c.a *= uScanA[i];
-  return c;
+// the room map: which kind of thing lies in direction d (0 = not scanned yet)
+float worldId(vec3 d) {
+  vec2 e = vec2(atan(d.x, -d.z) / (2.0 * PI) + 0.5, acos(clamp(d.y, -1.0, 1.0)) / PI);
+  return floor(texture(uWorld, e).r * 255.0 + 0.5);
+}
+vec3 palCol(float id) { return texture(uPal, vec2((id + 0.5) / 256.0, 0.5)).rgb; }
+float lum(vec2 uv) { return dot(texture(uCam, uv).rgb, vec3(0.299, 0.587, 0.114)); }
+
+// the line world: dark space, borders between things drawn in their colours, a grid on floor and ceiling,
+// and faint lines where the camera picture itself has edges
+vec3 lineWorld(vec3 d, vec2 uv, bool camIn) {
+  vec3 col = vec3(0.016, 0.027, 0.055);
+  float id = worldId(d);
+  vec3 pc = id > 0.0 ? palCol(id) : vec3(0.3);
+  if (id > 0.0) col += pc * 0.07;
+  // borders: does a nearby direction belong to something else?
+  float a = worldId(normalize(d + uR * uEdge)), b = worldId(normalize(d - uR * uEdge));
+  float c = worldId(normalize(d + uU * uEdge)), e = worldId(normalize(d - uU * uEdge));
+  if (id > 0.0 && (a != id || b != id || c != id || e != id)) col = pc;
+  // floor / ceiling grids every 50 cm
+  if (id == uFloorId && d.y < -0.02) {
+    vec2 p = d.xz * (uEyeH / -d.y) * 2.0, f = abs(fract(p) - 0.5);
+    float g = smoothstep(0.47, 0.5, max(f.x, f.y));
+    col = mix(col, pc * 0.8, g * clamp(3.0 * -d.y, 0.0, 1.0));
+  }
+  if (id == uCeilId && d.y > 0.02) {
+    vec2 p = d.xz * (uCeilH / d.y) * 2.0, f = abs(fract(p) - 0.5);
+    float g = smoothstep(0.47, 0.5, max(f.x, f.y));
+    col = mix(col, pc * 0.8, g * clamp(3.0 * d.y, 0.0, 1.0));
+  }
+  // edges in the live camera picture (Sobel)
+  if (camIn) {
+    vec2 t = uCamTexel * 1.5;
+    float gx = lum(uv + vec2(t.x, 0)) - lum(uv - vec2(t.x, 0));
+    float gy = lum(uv + vec2(0, t.y)) - lum(uv - vec2(0, t.y));
+    float m = length(vec2(gx, gy));
+    col = mix(col, vec3(0.75, 0.95, 1.0), smoothstep(0.08, 0.25, m) * 0.55);
+  }
+  return col;
 }
 
 float h3(vec3 p) {
@@ -397,22 +424,9 @@ void main() {
   vec2 tu = rs > 0.0 ? ts * (r / rs) : ts;
   if (uMode == 1) {
     vec2 uv = vec2(0.5 + tu.x / (2.0 * uCamTan.x), 0.5 - tu.y / (2.0 * uCamTan.y));
-    vec3 col = vec3(0);
-    if (uCamOk > 0.5 && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0) col = texture(uCam, uv).rgb;
-    // scans, oldest first (they can show beyond the camera's edge too: what was seen there before)
-    if (uScanN > 0) {
-      vec3 d = normalize(uF + uR * tu.x + uU * tu.y);
-      vec4 s = scanAt(uScan0, 0, d); col = mix(col, s.rgb, s.a);
-      if (uScanN > 1) { s = scanAt(uScan1, 1, d); col = mix(col, s.rgb, s.a); }
-      if (uScanN > 2) { s = scanAt(uScan2, 2, d); col = mix(col, s.rgb, s.a); }
-      if (uScanN > 3) { s = scanAt(uScan3, 3, d); col = mix(col, s.rgb, s.a); }
-    }
-    // while the AI is busy: a scanning line sweeps up and down
-    if (uBusy > 0.5) {
-      float y = sin(uT * 2.5) * 0.7;
-      float b = smoothstep(0.03, 0.0, abs(tu.y - y));
-      col = mix(col, vec3(0.3, 0.9, 1.0), b * 0.85);
-    }
+    bool camIn = uCamOk > 0.5 && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
+    vec3 col = camIn ? texture(uCam, uv).rgb : vec3(0);
+    if (uLines > 0.5) col = lineWorld(normalize(uF + uR * tu.x + uU * tu.y), uv, camIn);
     o = vec4(col, 1.0);
     return;
   }
@@ -569,8 +583,38 @@ function scanColor(label) {
   const f = n => { const k = (n + hue / 30) % 12; return 255 * (l - s * Math.min(l, 1 - l) * Math.max(-1, Math.min(k - 3, 9 - k, 1))); };
   return [f(0), f(8), f(4)].map(Math.round);
 }
-let scanner = null, scannerLoading = null, scanBusy = false;
-const scans = [];   // oldest first: { tex, R, U, F, th, tv, t }
+/* The room map: one label per direction around you (an equirectangular picture, like a world map
+   wrapped around your head). Every scan writes what it saw into the directions it covered, so the map
+   fills in as you look around, and newer scans replace older ones. */
+let scanner = null, scannerLoading = null, scanBusy = false, scanLooping = false, lineMode = false;
+const worldIds = new Uint8Array(WORLD_W * WORLD_H);
+const labelIds = new Map();            // label -> 1..255 (0 = not seen yet)
+const palette = new Uint8Array(256 * 4);
+let worldDirty = false, palDirty = false, lastShares = "";
+function idFor(label) {
+  let id = labelIds.get(label);
+  if (id) return id;
+  if (labelIds.size >= 254) return 255;
+  id = labelIds.size + 1; labelIds.set(label, id);
+  const [r, g, b] = scanColor(label);
+  palette.set([r, g, b, 255], id * 4); palDirty = true;
+  return id;
+}
+const worldTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, worldTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, WORLD_W, WORLD_H, 0, gl.RED, gl.UNSIGNED_BYTE, worldIds);
+const palTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, palTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, palette);
+
 async function loadScanner() {
   if (scanner) return scanner;
   if (scannerLoading) return scannerLoading;
@@ -581,16 +625,16 @@ async function loadScanner() {
     let p = null;
     if (navigator.gpu) { try { p = await tf.pipeline("image-segmentation", SCAN_MODEL, { device: "webgpu" }); } catch (e) { p = null; } }
     if (!p) p = await tf.pipeline("image-segmentation", SCAN_MODEL);
-    scanner = p; note.textContent = "部屋スキャンの準備ができました。画面の中央の上の方を押すと調べます。";
+    scanner = p; note.textContent = "スキャン中：見回すと部屋の地図ができていきます。中央の上を押すと線画の世界に切り替わります。";
     return p;
   })().catch(e => { note.textContent = "部屋を調べる AI を読み込めませんでした（" + (e.message || e) + "）"; scannerLoading = null; return null; });
   return scannerLoading;
 }
-async function doScan() {
+// one scan: freeze the picture and the head's direction, ask the AI, write the labels into the room map
+async function scanOnce() {
   if (scanBusy || !camOn || vid.readyState < 2 || !vid.videoWidth) return;
   scanBusy = true;
   try {
-    // freeze this moment: the picture and which way the head faced
     const q = headQ();
     const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
     const th = CAM_TAN_H / S.zoom, tv = th * vid.videoHeight / vid.videoWidth;
@@ -600,66 +644,61 @@ async function doScan() {
     const seg = await loadScanner();
     if (!seg) return;
     const t0 = performance.now();
-    const parts = await seg(shot.toDataURL("image/jpeg", 0.9));
+    const parts = await seg(shot.toDataURL("image/jpeg", 0.85));
     const ms = Math.round(performance.now() - t0);
-    // paint: one colour per kind of thing, plus its name where it sits
-    const over = document.createElement("canvas"); over.width = w; over.height = h;
-    const oc = over.getContext("2d"), img = oc.createImageData(w, h), px = img.data;
-    const tags = [], shares = [];
+    const ids = new Uint8Array(w * h), shares = [];
     for (const p of parts) {
       const label = String(p.label).trim(), m = p.mask, d = m.data, step = d.length / (m.width * m.height);
-      const [r, g, b] = scanColor(label);
-      let n = 0, sx = 0, sy = 0;
+      const id = idFor(label);
+      let n = 0;
       for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
         const mx = Math.min(m.width - 1, Math.floor(x * m.width / w)), my = Math.min(m.height - 1, Math.floor(y * m.height / h));
         if (d[(my * m.width + mx) * step] < 128) continue;
-        const i = (y * w + x) * 4; px[i] = r; px[i + 1] = g; px[i + 2] = b; px[i + 3] = 255;
-        n++; sx += x; sy += y;
+        ids[y * w + x] = id; n++;
       }
-      const share = n / (w * h);
-      if (share > 0) shares.push([SCAN_JA[label] || label, share]);
-      if (share >= SCAN_MIN_SHARE) tags.push([SCAN_JA[label] || label, sx / n, sy / n, share]);
+      if (n) shares.push([SCAN_JA[label] || label, n / (w * h)]);
     }
-    oc.putImageData(img, 0, 0);
-    oc.textAlign = "center"; oc.textBaseline = "middle"; oc.lineJoin = "round";
-    for (const [name, x, y, share] of tags) {
-      oc.font = `bold ${Math.round(14 + 14 * Math.min(1, share * 4))}px system-ui, sans-serif`;
-      oc.lineWidth = 4; oc.strokeStyle = "rgba(0,0,0,.85)"; oc.strokeText(name, x, y);
-      oc.fillStyle = "#fff"; oc.fillText(name, x, y);
+    // into the room map, by direction (two map pixels per scan pixel across, so no gaps)
+    for (let y = 0; y < h; y++) {
+      const ty = (0.5 - (y + 0.5) / h) * 2 * tv;
+      for (let x = 0; x < w; x++) {
+        const id = ids[y * w + x]; if (!id) continue;
+        const tx = ((x + 0.5) / w - 0.5) * 2 * th;
+        let dx = F[0] + R[0] * tx + U[0] * ty, dy = F[1] + R[1] * tx + U[1] * ty, dz = F[2] + R[2] * tx + U[2] * ty;
+        const l = 1 / Math.hypot(dx, dy, dz); dx *= l; dy *= l; dz *= l;
+        const u = Math.atan2(dx, -dz) / (2 * PI) + 0.5, v = Math.acos(Math.max(-1, Math.min(1, dy))) / PI;
+        const X = Math.floor(u * WORLD_W) % WORLD_W, Y = Math.min(WORLD_H - 1, Math.floor(v * WORLD_H));
+        worldIds[Y * WORLD_W + X] = id; worldIds[Y * WORLD_W + (X + 1) % WORLD_W] = id;
+        if (Y + 1 < WORLD_H) worldIds[(Y + 1) * WORLD_W + X] = id;
+      }
     }
-    const tex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, over);
-    scans.push({ tex, R, U, F, th, tv, t: performance.now() });
-    while (scans.length > MAX_SCANS) gl.deleteTexture(scans.shift().tex);
+    worldDirty = true;
     shares.sort((a, b) => b[1] - a[1]);
-    document.getElementById("note").textContent = "スキャン結果（" + ms + "ms）：" +
-      shares.slice(0, 8).map(([n, s]) => n + " " + Math.round(s * 100) + "%").join("・");
+    lastShares = "いま見ている所（" + ms + "ms）：" + shares.slice(0, 6).map(([n, s]) => n + " " + Math.round(s * 100) + "%").join("・");
+    document.getElementById("note").textContent = lastShares;
   } catch (e) {
     document.getElementById("note").textContent = "スキャンできませんでした（" + (e.message || e) + "）";
   } finally { scanBusy = false; }
 }
-function clearScans() { while (scans.length) gl.deleteTexture(scans.shift().tex); }
-function setScanUniforms(u, now) {
-  const n = S.place === "scan" ? scans.length : 0;
-  gl.uniform1i(u.uScanN, n);
-  gl.uniform1f(u.uBusy, S.place === "scan" && (scanBusy || (scannerLoading && !scanner)) ? 1 : 0);
-  const R = [], U = [], F = [], TN = [], A = [];
-  for (let i = 0; i < MAX_SCANS; i++) {
-    const s = scans[i];
-    R.push(...(s ? s.R : [1, 0, 0])); U.push(...(s ? s.U : [0, 1, 0])); F.push(...(s ? s.F : [0, 0, -1]));
-    TN.push(s ? s.th : 1, s ? s.tv : 1);
-    // a fresh scan flashes, then settles to SCAN_ALPHA
-    A.push(s ? SCAN_ALPHA + (0.9 - SCAN_ALPHA) * Math.max(0, 1 - (now - s.t) / 1200) : 0);
-    gl.uniform1i(u["uScan" + i], 2 + i);
-    gl.activeTexture(gl.TEXTURE2 + i); gl.bindTexture(gl.TEXTURE_2D, s && i < n ? s.tex : maskTex);
+// keep scanning while the room scan is on screen
+async function scanLoop() {
+  if (scanLooping) return;
+  scanLooping = true;
+  while (S.place === "scan" && window.started) {
+    await scanOnce();
+    await new Promise(r => setTimeout(r, SCAN_GAP_MS));
   }
-  gl.uniform3fv(u["uScanR[0]"], R); gl.uniform3fv(u["uScanU[0]"], U); gl.uniform3fv(u["uScanF[0]"], F);
-  gl.uniform2fv(u["uScanTan[0]"], TN); gl.uniform1fv(u["uScanA[0]"], A);
+  scanLooping = false;
+}
+function clearScans() { worldIds.fill(0); worldDirty = true; }
+function setScanUniforms(u) {
+  if (worldDirty) { gl.bindTexture(gl.TEXTURE_2D, worldTex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, WORLD_W, WORLD_H, gl.RED, gl.UNSIGNED_BYTE, worldIds); worldDirty = false; }
+  if (palDirty) { gl.bindTexture(gl.TEXTURE_2D, palTex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 256, 1, gl.RGBA, gl.UNSIGNED_BYTE, palette); palDirty = false; }
+  gl.uniform1i(u.uWorld, 2); gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, worldTex);
+  gl.uniform1i(u.uPal, 3); gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, palTex);
+  gl.uniform1f(u.uLines, S.place === "scan" && lineMode ? 1 : 0);
+  gl.uniform1f(u.uFloorId, labelIds.get("floor") || -1); gl.uniform1f(u.uCeilId, labelIds.get("ceiling") || -1);
+  gl.uniform2f(u.uCamTexel, 1 / (vid.videoWidth || 640), 1 / (vid.videoHeight || 480));
 }
 
 let mmW = 0, mmH = 0;
@@ -755,7 +794,8 @@ function frame(now) {
   gl.uniform2f(u.uCamTan, th, tv);
   gl.uniform1i(u.uCam, 0); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, camTex);
   gl.uniform1i(u.uMask, 1); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, maskTex);
-  setScanUniforms(u, now);
+  gl.uniform1f(u.uEdge, EDGE_ANGLE); gl.uniform1f(u.uCeilH, CEIL_H);
+  setScanUniforms(u);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindVertexArray(vaoFull); gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -824,7 +864,7 @@ async function syncCam() {
   if (!needsCam()) { stopCam(); return true; }
   const ok = await startCam();
   if (ok && S.me && S.place !== "cam" && S.place !== "scan") loadSeg();
-  if (ok && S.place === "scan") loadScanner();   // start the download early, before the first press
+  if (ok && S.place === "scan") { loadScanner(); if (window.started) scanLoop(); }
   return ok;
 }
 
@@ -854,7 +894,7 @@ for (const b of document.querySelectorAll("#modes div")) b.addEventListener("cli
   S.place = b.dataset.m; save(); showVals(); syncCam();
   pos = [0, 0, 0];                      // a new place: start at its usual spot
 });
-document.getElementById("scanclear").addEventListener("click", () => { clearScans(); document.getElementById("note").textContent = "塗った色を消しました。"; });
+document.getElementById("scanclear").addEventListener("click", () => { clearScans(); document.getElementById("note").textContent = "部屋の地図を消しました。"; });
 for (const b of document.querySelectorAll("#togs div")) b.addEventListener("click", () => {
   S[b.dataset.t] = !S[b.dataset.t]; save(); showVals(); syncCam();
 });
@@ -883,6 +923,7 @@ document.getElementById("go").addEventListener("click", async () => {
     if (needsCam() && !(await syncCam())) return;
     window.started = true;
     document.getElementById("go").textContent = "つづける";
+    if (S.place === "scan") scanLoop();
     setTimeout(doRecenter, 400);
   }
   panel.classList.add("off");
@@ -895,7 +936,7 @@ let drag = null, tapTimer = 0, lastTap = 0;
 const walkers = new Set();
 cv.addEventListener("pointerdown", e => {
   if (window.started && inWalkZone(e.clientX, e.clientY)) {
-    if (S.place === "scan") { doScan(); return; }   // in the room scan, the same spot scans instead of walking
+    if (S.place === "scan") { lineMode = !lineMode; return; }   // in the room scan, the same spot switches the line world
     walkers.add(e.pointerId); walking = walkers.size; return;
   }
   drag = { x: e.clientX, y: e.clientY, yaw: dragYaw, pitch: dragPitch, moved: false };
