@@ -27,10 +27,12 @@
   .btns div { flex:1; text-align:center; padding:11px 0; border-radius:12px; font-weight:bold; font-size:15px; }
   #go { background:#7fb4ff; color:#0b0b0a; }
   #reset { background:#252832; flex:0 0 7em !important; font-weight:normal !important; }
-  .modes { display:flex; gap:6px; margin:6px 0 8px; }
-  .modes div { flex:1; text-align:center; padding:8px 0; border-radius:10px; background:#252832; font-size:13px; }
+  .modes { display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 8px; }
+  .modes div { flex:1 1 84px; text-align:center; padding:8px 0; border-radius:10px; background:#252832; font-size:13px; }
   .modes div.on { background:#7fb4ff; color:#0b0b0a; font-weight:bold; }
   #togs div { flex:0 0 auto; padding:8px 16px; }
+  /* the square the "what is this" mode looks at, drawn over each lens */
+  .whatbox { position:absolute; z-index:3; display:none; border:2px dashed rgba(127,180,255,.9); border-radius:12px; pointer-events:none; }
   #togs div.on::before { content:"✓ "; }
   video { position:fixed; width:1px; height:1px; opacity:0; pointer-events:none; }
 </style>
@@ -40,16 +42,19 @@
 <canvas id="c"></canvas>
 <canvas id="guide"></canvas>
 <div class="hud" id="hudL" style="display:none"></div><div class="hud" id="hudR" style="display:none"></div>
+<div class="whatbox" id="whatL"></div><div class="whatbox" id="whatR"></div>
 <video id="vid" playsinline muted autoplay></video>
 <video id="pcvid" playsinline muted autoplay></video>
 <div id="panel">
   <b>VR</b>
   <div class="s">黄色い十字が、それぞれのレンズの真ん中に来るように合わせてください（押し続けると連続で動きます）。<br>ゴーグルの中で：カメラ使用中は画面中央の上半分を押すとカメラの倍率が×5／元に切り替わります。カメラを使わないモードでは画面中央を押している間、向いている方へ歩きます。ほかを1回タップ → この調整に戻る／2回タップ → いま向いている方が正面</div>
-  <div class="modes" id="modes"><div data-m="river">夜の川辺</div><div data-m="sunset">夕焼けの海</div><div data-m="meadow">昼の草原</div><div data-m="space">宇宙</div><div data-m="cam">カメラ</div><div data-m="scan">部屋スキャン</div><div data-m="pccam">PCカメラ</div><div data-m="hands">手で遊ぶ(AR)</div></div>
+  <div class="modes" id="modes"><div data-m="river">夜の川辺</div><div data-m="sunset">夕焼けの海</div><div data-m="meadow">昼の草原</div><div data-m="space">宇宙</div><div data-m="cam">カメラ</div><div data-m="scan">部屋スキャン</div><div data-m="ascii">アスキーアート</div><div data-m="what">なにこれ？</div><div data-m="pccam">PCカメラ</div><div data-m="hands">手で遊ぶ(AR)</div></div>
   <div class="modes" id="togs"><div data-t="snow">雪</div><div data-t="me">自分を映す</div><div data-t="flip">向きを反転</div></div>
   <div id="ctl"></div>
   <div class="s" id="pccamhelp" style="display:none">PCカメラ：PC で <b style="font-size:12px">kodair918-del.github.io/hub/pccam/</b> を開いて、番号 <b id="pccode" style="font-size:20px;color:#7fb4ff;letter-spacing:.15em"></b> を入れて「送る」を押すと、PC のカメラの映像が視界いっぱいに出ます。<span id="pcstate"></span></div>
   <div class="s" id="scanhelp" style="display:none">部屋スキャン：画面中央の下半分を押すと「線画」に切り替わり、もう一度押すとカメラに戻ります。上半分を押すとカメラの倍率が×5／元に切り替わります。「線を部屋に残す」なら、見回すほど部屋じゅうが線画になっていきます。<span id="scanclear" style="display:none"></span></div>
+  <div class="s" id="asciihelp" style="display:none">アスキーアート：カメラの映像を文字（. : - = + * # % @）で描きます。明るいほど濃い文字になります。中央の上半分を押すと×5に寄れ、寄るほど細かい文字になります。</div>
+  <div class="s" id="whathelp" style="display:none">なにこれ？：画面の真ん中（青い枠の中）に映っているものを当てます。マグカップ・財布・スマホ・本など。0.8秒ごとに見直すので、枠の中に入れて少し待ってください。<span id="whatstate"></span></div>
   <div id="lineopts" style="display:none">
     <div class="modes" id="lstyle"><div data-ls="simple">シンプル</div><div data-ls="neon">ネオン</div><div data-ls="sketch">手描き</div></div>
     <div class="modes" id="lcol"><div data-lc="white">白</div><div data-lc="cyan">水色</div><div data-lc="green">緑</div><div data-lc="pink">ピンク</div></div>
@@ -64,7 +69,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.20";
+const VERSION = "2026-11-26.21";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -95,7 +100,7 @@ const CAM_TAN_H = Math.tan(34 * Math.PI / 180);   // half of the 1x camera's hor
 // zoom: camera picture size (1 = true size), place: river | sunset | meadow | space | cam,
 // snow: snowflakes on/off, me: cut the body out of the camera picture and put it in the place
 const DEFAULTS = { sep: 60, vy: 0, k: 1, dist: 39, zoom: 1, place: "river", snow: true, me: false, flip: false, lstyle: "simple", lcol: "white", lkeep: true };
-const PLACES = ["river", "sunset", "meadow", "space", "cam", "scan", "pccam", "hands"];
+const PLACES = ["river", "sunset", "meadow", "space", "cam", "scan", "ascii", "what", "pccam", "hands"];
 // PC camera: the PC's webcam comes in over WebRTC (PeerJS finds the PC; the video goes directly between the two)
 const PEER_PREFIX = "desxus-vr-";   // this page's id = prefix + a 4-digit number the PC page types in
 const PCCAM_TAN_H = Math.tan(34 * Math.PI / 180);   // half of a laptop webcam's horizontal view (about 68 deg)
@@ -301,6 +306,9 @@ uniform sampler2D uCam, uMask;
 uniform sampler2D uWorld, uPal;
 uniform float uLines, uFloorId, uCeilId, uEdge, uCeilH, uLineW, uLineLo, uLineHi;
 uniform vec2 uCamTexel;
+uniform sampler2D uAsciiTex, uGlyphTex;   // the ASCII mode: cell brightness, and the characters' shapes
+uniform vec2 uAsciiN;                     // characters across / down the camera picture
+uniform float uCharN;                     // characters in the atlas
 out vec4 o;
 const float PI = 3.14159265, DEG = PI / 180.0;
 
@@ -558,6 +566,21 @@ vec3 lineWorld(vec3 d, vec2 uv, bool camIn) {
   return uLCol * c0.x;
 }
 
+// the ASCII mode: the camera picture cut into cells, each drawn as the character matching its brightness.
+// The grid (uAsciiTex) is made by asciiPasses(); the atlas (uGlyphTex) holds the characters in one row.
+vec3 asciiLook(vec2 tu) {
+  vec2 uv = camUV(tu);
+  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return vec3(0.0);
+  vec2 cell = uv * uAsciiN;
+  vec2 f = clamp(fract(cell), 0.06, 0.94);        // stay inside the glyph: no bleed from the next one
+  float L = texture(uAsciiTex, (floor(cell) + 0.5) / uAsciiN).r;
+  float t = clamp((L - 0.035) / 0.93, 0.0, 1.0);
+  float k = floor(t * (uCharN - 0.001));
+  float a = texture(uGlyphTex, vec2((k + f.x) / uCharN, 1.0 - f.y)).r;
+  vec3 ink = vec3(0.42, 1.0, 0.55);               // a green screen
+  return ink * (a * (0.5 + 0.8 * L) + 0.03 * L + 0.01);
+}
+
 void main() {
   vec2 fc = gl_FragCoord.xy;
   float xm = fc.x / uRes.x * uMm.x, ym = (uRes.y - fc.y) / uRes.y * uMm.y;
@@ -571,6 +594,7 @@ void main() {
   }
   if (r > uMaxTan || !(r >= 0.0)) { o = vec4(0, 0, 0, 1); return; }
   vec2 tu = rs > 0.0 ? ts * (r / rs) : ts;
+  if (uMode == 2) { o = vec4(asciiLook(tu), 1.0); return; }
   if (uMode == 1) {
     vec2 uv = camUV(tu);
     bool camIn = uCamOk > 0.5 && uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
@@ -915,10 +939,14 @@ function hud(show) {
   if (show) hudUntil = performance.now() + 2500;
   const pcWait = S.place === "pccam" && !pcConnected;
   const handsWait = S.place === "hands" && !hands;
-  const on = window.started && ((usesCamera() && (cameraZoomed || performance.now() < hudUntil)) || pcWait || handsWait || ((S.place === "pccam" || S.place === "hands") && performance.now() < hudUntil) ||
+  const on = window.started && ((usesCamera() && (cameraZoomed || performance.now() < hudUntil)) || pcWait || handsWait ||
+    S.place === "what" || ((S.place === "pccam" || S.place === "hands") && performance.now() < hudUntil) ||
     (S.place === "scan" && (performance.now() < hudUntil || (SCAN_AI && (!scannerReady || scanErr)))));
   const txt = S.place === "hands" ? (handsErr ? "手の AI を読み込めません" : hands ? "割った数 " + popped : "手の AI を読み込み中…") :
     S.place === "pccam" ? (pcConnected ? "PC カメラ" : "PC を待っています　番号 " + pcCode()) :
+    S.place === "what" ? (clfErr ? "判別のしくみを読み込めません" :
+      whatTop ? "これは " + whatTop.name + "？ " + Math.round(whatTop.score * 100) + "%" : "真ん中に映してね（判別中…）") :
+    S.place === "ascii" ? "アスキーアート" :
     (lineMode ? "線画 ON" : "カメラ") + (!SCAN_AI ? "" : "　" +
     (scanErr ? "AI エラー" : scannerReady ? "スキャン " + scanCount + " 回" : "AI 読み込み中…"));
   const label = usesCamera() ? "　×" + cameraZoomValue().toFixed(cameraZoomed ? 0 : 2) +
@@ -928,6 +956,20 @@ function hud(show) {
     el.textContent = txt + label; el.style.display = on ? "" : "none";
     el.style.left = (VW() / 2 + side * S.sep / 2 * PX_PER_MM) + "px";   // above each lens centre
   });
+  placeWhatBox();
+}
+// the dashed square over each lens: the part of the picture the "what is this" mode looks at
+function placeWhatBox() {
+  const on = window.started && S.place === "what";
+  const half = CLF_CROP * Math.min(camTanNow[0], camTanNow[1]) * S.dist * PX_PER_MM;   // half of the square
+  for (const [id, side] of [["whatL", -1], ["whatR", 1]]) {
+    const el = document.getElementById(id);
+    if (!on) { el.style.display = "none"; continue; }
+    el.style.display = "block";
+    el.style.left = (VW() / 2 + side * S.sep / 2 * PX_PER_MM - half) + "px";
+    el.style.top = (VH() / 2 - S.vy * PX_PER_MM - half) + "px";
+    el.style.width = el.style.height = (half * 2) + "px";
+  }
 }
 setInterval(() => hud(false), 300);
 function onScanMessage(ev) {
@@ -1081,7 +1123,7 @@ function frame(now) {
   const q = headQ();
   const R = qRot(q, 1, 0, 0), U = qRot(q, 0, 1, 0), F = qRot(q, 0, 0, -1);
   const pc = S.place === "pccam";
-  const cam = S.place === "cam" || S.place === "scan" || S.place === "hands" || pc;
+  const cam = S.place === "cam" || S.place === "scan" || S.place === "ascii" || S.place === "what" || S.place === "hands" || pc;
   const needCam = cam || S.me;
   const src = pc ? pcvid : vid;          // which picture fills the view
   let camOk = 0;
@@ -1092,31 +1134,33 @@ function frame(now) {
     camOk = 1;
   }
   gl.disable(gl.BLEND);
+  // With the portrait lock the iPhone's own camera delivers a portrait picture: its long side runs along
+  // the goggles' left-right, so it is read turned by the stage's turn. (The PC camera always comes landscape.)
+  const vw = src.videoWidth || 4, vh = src.videoHeight || 3;
+  const camRot = !pc && ROT && vh > vw ? ROT : 0;
+  const [tanX, tanY] = camViewTan(vw, vh, camRot, cam);
+  camRotNow = camRot; camTanNow = [tanX, tanY];
   if (S.place === "scan" && camOk && !pc) linePasses(now);
+  if (S.place === "ascii" && camOk && !pc) asciiPasses();
   gl.useProgram(P.p); const u = P.u;
   setLens(u);
   gl.uniform2f(u.uRes, cv.width, cv.height);
   stepWalk(dt, F);
   gl.uniform3f(u.uR, ...R); gl.uniform3f(u.uU, ...U); gl.uniform3f(u.uF, ...F); gl.uniform3f(u.uPos, ...pos);
   gl.uniform1f(u.uT, T); gl.uniform1f(u.uEyeH, EYE_HEIGHT);
-  gl.uniform1i(u.uMode, cam ? 1 : 0); gl.uniform1f(u.uCamOk, camOk);
+  gl.uniform1i(u.uMode, cam ? (S.place === "ascii" ? 2 : 1) : 0); gl.uniform1f(u.uCamOk, camOk);
   gl.uniform1i(u.uScene, Math.max(0, PLACES.indexOf(S.place)));
   gl.uniform1f(u.uMe, S.me && !cam ? 1 : 0); gl.uniform1f(u.uMaskOk, maskOk);
   gl.uniform2f(u.uSegTh, SEG_THRESHOLD[0], SEG_THRESHOLD[1]);
-  // With the portrait lock the iPhone's own camera delivers a portrait picture: its long side runs along
-  // the goggles' left-right, so it is read turned by the stage's turn. (The PC camera always comes landscape.)
-  const vw = src.videoWidth || 4, vh = src.videoHeight || 3;
-  const camRot = !pc && ROT && vh > vw ? ROT : 0;
-  const [tanX, tanY] = camViewTan(vw, vh, camRot, cam);
   gl.uniform2f(u.uCamTan, tanX, tanY);
   gl.uniform1i(u.uCamRot, camRot);
-  camRotNow = camRot; camTanNow = [tanX, tanY];
   gl.uniform1i(u.uCam, 0); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, camTex);
   gl.uniform1i(u.uMask, 1); gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, maskTex);
   gl.uniform1f(u.uEdge, EDGE_ANGLE); gl.uniform1f(u.uCeilH, CEIL_H);
   gl.uniform1f(u.uLineW, LINE_WIDTH); gl.uniform1f(u.uLineLo, LINE_LO); gl.uniform1f(u.uLineHi, LINE_HI);
   setScanUniforms(u);
   setLineUniforms(u);
+  setAsciiUniforms(u);
   gl.activeTexture(gl.TEXTURE0);
   gl.bindVertexArray(vaoFull); gl.drawArrays(gl.TRIANGLES, 0, 3);
 
@@ -1238,6 +1282,108 @@ function findFingers(R, U, F) {
     fingers = (res.landmarks || []).map(lm => camPointToDir(lm[8].x, lm[8].y, R, U, F));   // 8 = index fingertip
   } catch (e) { /* a dropped frame is fine */ }
 }
+/* ---------- "なにこれ？": what is in the middle of the view ----------
+   MediaPipe's image classifier (EfficientNet-Lite0: 1000 everyday things) looks at the middle square of
+   the camera picture about once a second and names what it finds (coffee mug, wallet, phone, ...). */
+const CLF_MODEL = "https://storage.googleapis.com/mediapipe-models/image_classifier/efficientnet_lite0/float32/1/efficientnet_lite0.tflite";
+const CLF_CROP = 0.6;        // the middle square, as a part of the picture's short side
+const CLF_GAP_MS = 800;      // how often it looks again
+const WHAT_JA = {
+  "coffee mug": "マグカップ", "cup": "カップ", "coffee cup": "コーヒーカップ", "beer glass": "ビールグラス",
+  "wine bottle": "ワインのビン", "water bottle": "水筒", "pop bottle": "ペットボトル", "beer bottle": "ビールのビン",
+  "whiskey jug": "ウイスキーのビン", "pitcher": "ピッチャー", "water jug": "水差し", "measuring cup": "計量カップ",
+  "cocktail shaker": "シェイカー", "saltshaker": "塩入れ", "vase": "花びん", "pot": "鍋", "frying pan": "フライパン",
+  "wok": "中華鍋", "spatula": "フライ返し", "ladle": "お玉", "strainer": "ざる", "wooden spoon": "木べら",
+  "corkscrew": "コルク抜き", "can opener": "缶切り", "bottle opener": "栓抜き", "plate": "皿", "soup bowl": "茶碗",
+  "mixing bowl": "ボウル", "bucket": "バケツ", "basket": "かご", "shopping basket": "買い物かご", "hamper": "洗濯かご",
+  "wallet": "財布", "purse": "ハンドバッグ", "backpack": "リュック", "knapsack": "リュック", "plastic bag": "ビニール袋",
+  "cellular telephone": "スマホ", "cellphone": "スマホ", "iPod": "音楽プレーヤー", "remote control": "リモコン",
+  "notebook": "ノート", "notebook computer": "ノートPC", "laptop": "ノートPC", "desktop computer": "パソコン",
+  "computer keyboard": "キーボード", "mouse": "マウス", "monitor": "モニター", "television": "テレビ",
+  "book jacket": "本", "comic book": "本", "binder": "ファイル", "envelope": "封筒", "packet": "小包",
+  "carton": "段ボール", "crate": "木箱", "ballpoint": "ボールペン", "fountain pen": "万年筆",
+  "pencil sharpener": "えんぴつ削り", "pencil box": "ペンケース", "rubber eraser": "消しゴム", "ruler": "定規",
+  "scissors": "はさみ", "letter opener": "ペーパーナイフ", "sunglasses": "サングラス", "sunglass": "サングラス",
+  "clock": "時計", "wall clock": "掛け時計", "digital watch": "腕時計", "stopwatch": "ストップウォッチ",
+  "digital clock": "デジタル時計", "table lamp": "電気スタンド", "lamp": "ランプ", "lampshade": "ランプシェード",
+  "candle": "ろうそく", "toilet tissue": "トイレットペーパー", "paper towel": "キッチンペーパー", "bath towel": "タオル",
+  "refrigerator": "冷蔵庫", "microwave": "電子レンジ", "toaster": "トースター", "dishwasher": "食洗機",
+  "washing machine": "洗濯機", "vacuum": "掃除機", "iron": "アイロン", "hair dryer": "ドライヤー",
+  "electric fan": "扇風機", "space heater": "ヒーター", "fan": "扇風機", "teddy": "ぬいぐるみ",
+  "tabby": "ネコ", "Persian cat": "ネコ", "Siamese cat": "ネコ", "Egyptian cat": "ネコ", "dog": "犬",
+  "golden retriever": "犬", "Labrador retriever": "犬", "banana": "バナナ", "apple": "リンゴ", "orange": "オレンジ",
+  "lemon": "レモン", "strawberry": "イチゴ", "pineapple": "パイナップル", "tomato": "トマト", "cucumber": "キュウリ",
+  "bell pepper": "ピーマン", "mushroom": "キノコ", "broccoli": "ブロッコリー", "head cabbage": "キャベツ",
+  "French loaf": "パン", "bagel": "ベーグル", "pretzel": "プレッツェル", "pizza": "ピザ", "hamburger": "ハンバーガー",
+  "hotdog": "ホットドッグ", "sandwich": "サンドイッチ", "carbonara": "パスタ", "espresso": "コーヒー",
+  "broom": "ほうき", "mop": "モップ", "sponge": "スポンジ", "soap dispenser": "ポンプ式せっけん",
+  "toothbrush": "歯ブラシ", "comb": "くし", "hair slide": "ヘアピン", "lipstick": "口紅", "lotion": "ローション",
+  "perfume": "香水", "sunscreen": "日焼け止め", "pill bottle": "薬のビン", "syringe": "注射器",
+  "tape player": "テーププレーヤー", "CD player": "CDプレーヤー", "headphones": "ヘッドホン",
+  "loudspeaker": "スピーカー", "microphone": "マイク", "reflex camera": "カメラ", "Polaroid camera": "カメラ",
+  "tripod": "三脚", "flashlight": "懐中電灯", "matchstick": "マッチ", "lighter": "ライター", "ashtray": "灰皿",
+  "bathtub": "浴槽", "shower curtain": "シャワーカーテン", "pillow": "まくら", "quilt": "布団", "bed": "ベッド",
+  "crib": "ベビーベッド", "desk": "机", "dining table": "テーブル", "chair": "椅子", "folding chair": "椅子",
+  "studio couch": "ソファ", "bookcase": "本棚", "wardrobe": "クローゼット", "chest": "タンス",
+  "trash can": "ゴミ箱", "wastebin": "ゴミ箱", "ashcan": "ゴミ箱", "mailbox": "ポスト", "face powder": "ファンデーション",
+};
+function whatName(raw) {
+  const s = String(raw || "").split(",")[0].trim().replace(/_/g, " ").toLowerCase();
+  return WHAT_JA[s] || s;
+}
+let clf = null, clfLoading = false, clfErr = "", clfLooping = false, clfShot = null, clfTs = 0;
+let whatTop = null, whatList = [];
+async function loadClf() {
+  if (clf || clfLoading) return;
+  clfLoading = true;
+  document.getElementById("note").textContent = "ものを判別するしくみを読み込んでいます（はじめは 18MB ほど、数十秒かかることがあります）…";
+  try {
+    const v = await import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/vision_bundle.mjs`);
+    const files = await v.FilesetResolver.forVisionTasks(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/wasm`);
+    const opts = d => ({ baseOptions: { modelAssetPath: CLF_MODEL, delegate: d }, runningMode: "VIDEO", maxResults: 4, scoreThreshold: 0.02 });
+    try { clf = await v.ImageClassifier.createFromOptions(files, opts("GPU")); }
+    catch (e) { clf = await v.ImageClassifier.createFromOptions(files, opts("CPU")); }
+    clfErr = "";
+    document.getElementById("note").textContent = "";
+    hud(true);
+  } catch (e) {
+    clfErr = String(e.message || e);
+    document.getElementById("note").textContent = "判別のしくみを読み込めませんでした（" + clfErr + "）";
+  }
+  clfLoading = false;
+}
+// what the middle of the picture is now (a square crop of the middle, like the box in the goggles)
+function clfOnce() {
+  if (!clf || !camOn || vid.readyState < 2 || !vid.videoWidth) return;
+  try {
+    const vw = vid.videoWidth, vh = vid.videoHeight, side = Math.round(Math.min(vw, vh) * CLF_CROP);
+    if (!clfShot) clfShot = document.createElement("canvas");
+    clfShot.width = 256; clfShot.height = 256;
+    clfShot.getContext("2d").drawImage(vid, (vw - side) / 2, (vh - side) / 2, side, side, 0, 0, 256, 256);
+    clfTs = Math.max(clfTs + 1, performance.now());
+    const res = clf.classifyForVideo(clfShot, clfTs);
+    const cats = (res.classifications && res.classifications[0] && res.classifications[0].categories) || [];
+    whatList = cats.slice(0, 3).map(c => ({ name: whatName(c.categoryName || c.displayName), score: c.score }));
+    whatTop = whatList[0] || null;
+    const el = document.getElementById("whatstate");
+    if (el) el.textContent = whatList.length
+      ? "　いま：" + whatList.map(c => c.name + " " + Math.round(c.score * 100) + "%").join("・")
+      : "　まだ分かりません。";
+  } catch (e) {
+    clfErr = String(e.message || e);
+    document.getElementById("note").textContent = "判別できませんでした（" + clfErr + "）";
+  }
+}
+async function clfLoop() {
+  if (clfLooping) return;
+  clfLooping = true;
+  while (S.place === "what" && window.started) {
+    clfOnce();
+    await new Promise(r => setTimeout(r, clf ? CLF_GAP_MS : 400));
+  }
+  clfLooping = false;
+}
+
 let actx = null;
 function popSound() {
   try {
@@ -1414,6 +1560,72 @@ void main() {
   o = vec4(E.r, E.g, 1.0, uMix * smoothstep(0.0, 0.04, e));
 }`;
 const PG = prog(VS_FULL, FS_GRAD), PT = prog(VS_FULL, FS_THIN), PK = prog(VS_FULL, FS_KEEP);
+
+/* ---------- the ASCII mode: the camera picture in characters ----------
+   1) The picture is cut into cells (as many as keep the characters about 7 px on the lens at the current zoom);
+      a small pass averages the brightness of each cell into a little texture.
+   2) The characters are drawn on a canvas once, as a row of white glyphs, and uploaded as one texture.
+   3) The main shader picks the character for each cell from its brightness and paints it green. */
+const AC_CHARS = " .:-=+*#%@";   // dark to bright
+const AC_CELL = 48;              // glyph size in the atlas, pixels
+const AC_WIDTH = 1.15;           // how wide one character should look on the lens, mm
+const FS_AC = `#version 300 es
+precision highp float;
+uniform sampler2D uCam; uniform vec2 uGrid;
+out vec4 o;
+float L(vec2 uv) { return dot(texture(uCam, uv).rgb, vec3(0.299, 0.587, 0.114)); }
+void main() {
+  vec2 uv = gl_FragCoord.xy / uGrid;
+  vec2 s = 0.25 / uGrid;    // a quarter cell in, so all four taps stay inside this cell
+  float v = 0.25 * (L(uv - s) + L(uv + vec2(s.x, -s.y)) + L(uv + vec2(-s.x, s.y)) + L(uv + s));
+  o = vec4(v, v, v, 1.0);
+}`;
+const PAC = prog(VS_FULL, FS_AC);
+let acGridT = null, acGlyphT = null, acCols = 0, acRows = 0;
+function makeGlyphTex() {
+  const n = AC_CHARS.length;
+  const c = document.createElement("canvas");
+  c.width = AC_CELL * n; c.height = AC_CELL;
+  const x = c.getContext("2d");
+  x.fillStyle = "#000"; x.fillRect(0, 0, c.width, c.height);
+  x.fillStyle = "#fff"; x.textAlign = "center"; x.textBaseline = "middle";
+  x.font = `bold ${Math.round(AC_CELL * 0.9)}px ui-monospace, Menlo, Consolas, monospace`;
+  for (let i = 0; i < n; i++) x.fillText(AC_CHARS[i], AC_CELL * (i + 0.5), AC_CELL * 0.54);
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);      // the canvas' top row at v = 1
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+// the camera picture cell by cell (called every frame while the ASCII mode is on)
+function asciiPasses() {
+  if (!acGlyphT) acGlyphT = makeGlyphTex();
+  const vw = vid.videoWidth, vh = vid.videoHeight;
+  const cols = Math.max(24, Math.min(120, Math.round(2 * camTanNow[0] * S.dist / AC_WIDTH)));
+  const rows = Math.max(8, Math.round(cols * vh / vw));
+  if (cols !== acCols || rows !== acRows) {
+    acCols = cols; acRows = rows; acGridT = makeTarget(cols, rows, gl.NEAREST);
+  }
+  gl.bindVertexArray(vaoFull);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, acGridT.fb); gl.viewport(0, 0, cols, rows); gl.disable(gl.BLEND);
+  gl.useProgram(PAC.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, camTex); gl.uniform1i(PAC.u.uCam, 0);
+  gl.uniform2f(PAC.u.uGrid, cols, rows);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, cv.width, cv.height);
+}
+function setAsciiUniforms(u) {
+  gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, acGridT ? acGridT.tex : maskTex); gl.uniform1i(u.uAsciiTex, 6);
+  gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, acGlyphT || maskTex); gl.uniform1i(u.uGlyphTex, 7);
+  gl.uniform2f(u.uAsciiN, Math.max(1, acCols), Math.max(1, acRows));
+  gl.uniform1f(u.uCharN, AC_CHARS.length);
+}
+
 function makeTarget(w, h, filter) {
   const tex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -1542,10 +1754,12 @@ function showVals() {
   for (const b of document.querySelectorAll("#modes div")) b.classList.toggle("on", b.dataset.m === S.place);
   for (const b of document.querySelectorAll("#togs div")) {
     b.classList.toggle("on", !!S[b.dataset.t]);
-    if (b.dataset.t === "me") b.style.display = ["cam", "scan", "pccam", "hands"].includes(S.place) ? "none" : "";
+    if (b.dataset.t === "me") b.style.display = usesCamera() ? "none" : "";
   }
   document.getElementById("scanhelp").style.display = S.place === "scan" ? "" : "none";
   document.getElementById("lineopts").style.display = S.place === "scan" ? "" : "none";
+  document.getElementById("asciihelp").style.display = S.place === "ascii" ? "" : "none";
+  document.getElementById("whathelp").style.display = S.place === "what" ? "" : "none";
   for (const b of document.querySelectorAll("#lstyle div")) b.classList.toggle("on", b.dataset.ls === S.lstyle);
   for (const b of document.querySelectorAll("#lcol div")) b.classList.toggle("on", b.dataset.lc === S.lcol);
   document.getElementById("lcol").style.display = S.lstyle === "sketch" ? "none" : "";
@@ -1555,8 +1769,8 @@ function showVals() {
   if (S.place === "pccam") startPeer();
   drawGuide();
 }
-function needsCam() { return S.place === "cam" || S.place === "scan" || S.place === "hands" || (S.me && S.place !== "pccam"); }
-function usesCamera() { return ["cam", "scan", "hands", "pccam"].includes(S.place) || S.me; }
+function needsCam() { return ["cam", "scan", "ascii", "what", "hands"].includes(S.place) || (S.me && S.place !== "pccam"); }
+function usesCamera() { return ["cam", "scan", "ascii", "what", "hands", "pccam"].includes(S.place) || S.me; }
 
 /* ---------- PC camera: wait for the PC page to call, then show what it sends ---------- */
 const pcvid = document.getElementById("pcvid");
@@ -1601,6 +1815,7 @@ async function syncCam() {
   const ok = await startCam();
   if (ok && S.me && S.place !== "cam" && S.place !== "scan") loadSeg();
   if (ok && S.place === "hands") loadHands();
+  if (ok && S.place === "what") { loadClf(); if (window.started) clfLoop(); }
   if (ok && S.place === "scan" && SCAN_AI) { loadScanner(); if (window.started) scanLoop(); }
   return ok;
 }
@@ -1671,6 +1886,7 @@ document.getElementById("go").addEventListener("click", async () => {
     window.started = true;
     document.getElementById("go").textContent = "つづける";
     if (S.place === "scan" && SCAN_AI) scanLoop();
+    if (S.place === "what") { loadClf(); clfLoop(); }
     setTimeout(doRecenter, 400);
   }
   panel.classList.add("off");
