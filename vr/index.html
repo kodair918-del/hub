@@ -53,7 +53,7 @@
 /* Home-screen apps keep an old copy of the page (GitHub Pages lets it be cached for 10 min, and the app
    often keeps it longer). So the page asks the server for its newest copy and, if its VERSION differs,
    loads that one. Bump VERSION on every change. */
-const VERSION = "2026-11-26.5";
+const VERSION = "2026-11-26.6";
 async function checkUpdate() {
   try {
     const t = await (await fetch(location.pathname + "?check=" + Date.now(), { cache: "no-store" })).text();
@@ -90,6 +90,8 @@ const TF_VER = "3.0.2";
 const SCAN_MODEL = "Xenova/segformer-b0-finetuned-ade-512-512";
 const SCAN_W = 448;          // the camera picture is shrunk to this width before the AI looks at it
 const SCAN_ON_GPU = false;   // true = faster scans, but the view hitches while the AI uses the GPU
+const SCAN_MIN_REGION = 0.004;   // patches smaller than this share of the picture are treated as noise
+const SCAN_CONF_MAX = 6;      // how many disagreeing scans it takes to change a direction's label
 const SCAN_GAP_MS = 250;     // pause between scans (scanning never stops while the room scan is open)
 const WORLD_W = 2048, WORLD_H = 1024;   // the room map: one label per direction (0.18 deg per map pixel)
 const EDGE_ANGLE = 0.006;    // how far apart (radians) two directions must disagree to draw a line there
@@ -185,11 +187,12 @@ vec3 lineWorld(vec3 d, vec2 uv, bool camIn) {
   vec3 col = vec3(0.016, 0.027, 0.055);
   float id = worldId(d);
   vec3 pc = id > 0.0 ? palCol(id) : vec3(0.3);
-  if (id > 0.0) col += pc * 0.07;
-  // borders: does a nearby direction belong to something else?
+  // borders: does a nearby direction belong to something else? (directions not scanned yet don't count,
+  // so the edge of what has been seen is not drawn as a line)
   float a = worldId(normalize(d + uR * uEdge)), b = worldId(normalize(d - uR * uEdge));
   float c = worldId(normalize(d + uU * uEdge)), e = worldId(normalize(d - uU * uEdge));
-  if (id > 0.0 && (a != id || b != id || c != id || e != id)) col = pc;
+  bool edge = (a > 0.0 && a != id) || (b > 0.0 && b != id) || (c > 0.0 && c != id) || (e > 0.0 && e != id);
+  if (id > 0.0 && edge) col = pc;
   // floor / ceiling grids every 50 cm
   if (id == uFloorId && d.y < -0.02) {
     vec2 p = d.xz * (uEyeH / -d.y) * 2.0, f = abs(fract(p) - 0.5);
@@ -606,7 +609,7 @@ self.onmessage = async ev => {
     }
     if (m.type === "clear") { world.fill(0); conf.fill(0); return; }
     if (m.type !== "scan") return;
-    const { w, h, R, U, F, th, tv } = m;
+    const { w, h, R, U, F, th, tv } = m;  // m also carries minRegion and confMax
     const oc = new OffscreenCanvas(w, h), cx = oc.getContext("2d");
     cx.drawImage(m.bitmap, 0, 0, w, h); m.bitmap.close();
     const img = cx.getImageData(0, 0, w, h);
@@ -644,30 +647,92 @@ self.onmessage = async ev => {
       for (const v of touched) tally[v] = 0;
     }
     ids = out;
-    // into the room map, with a vote: a direction keeps its label until several scans say otherwise
-    let x0 = W, x1 = -1, y0 = H, y1 = -1;
-    const put = (idx, id) => {
-      if (world[idx] === id) { if (conf[idx] < ${4}) conf[idx]++; }
-      else if (conf[idx] > 1) conf[idx]--;
-      else { world[idx] = id; conf[idx] = world[idx] ? 2 : 1; }
-    };
-    for (let y = 0; y < h; y++) {
-      const ty = (0.5 - (y + 0.5) / h) * 2 * tv;
-      for (let x = 0; x < w; x++) {
-        const id = ids[y * w + x]; if (!id) continue;
-        const tx = ((x + 0.5) / w - 0.5) * 2 * th;
-        let dx = F[0] + R[0] * tx + U[0] * ty, dy = F[1] + R[1] * tx + U[1] * ty, dz = F[2] + R[2] * tx + U[2] * ty;
-        const l = 1 / Math.hypot(dx, dy, dz); dx *= l; dy *= l; dz *= l;
-        const u = Math.atan2(dx, -dz) / (2 * Math.PI) + 0.5, v = Math.acos(Math.max(-1, Math.min(1, dy))) / Math.PI;
-        const X = Math.floor(u * W) % W, Y = Math.min(H - 1, Math.floor(v * H));
-        put(Y * W + X, id); put(Y * W + (X + 1) % W, id);
-        if (X < x0) x0 = X; if (X + 1 > x1) x1 = X + 1; if (Y < y0) y0 = Y; if (Y > y1) y1 = Y;
+    // small islands (under MIN_REGION of the picture) are noise: they take the label that surrounds them
+    {
+      const comp = new Int32Array(w * h).fill(-1), stack = new Int32Array(w * h), minPix = Math.round(w * h * m.minRegion);
+      let nc = 0;
+      for (let s = 0; s < w * h; s++) {
+        if (comp[s] >= 0) continue;
+        const lab = ids[s]; let top = 0, size = 0; stack[top++] = s; comp[s] = nc;
+        const members = [];
+        while (top) {
+          const p = stack[--top]; size++; members.push(p);
+          const px = p % w, py = (p - px) / w;
+          if (px > 0 && comp[p - 1] < 0 && ids[p - 1] === lab) { comp[p - 1] = nc; stack[top++] = p - 1; }
+          if (px < w - 1 && comp[p + 1] < 0 && ids[p + 1] === lab) { comp[p + 1] = nc; stack[top++] = p + 1; }
+          if (py > 0 && comp[p - w] < 0 && ids[p - w] === lab) { comp[p - w] = nc; stack[top++] = p - w; }
+          if (py < h - 1 && comp[p + w] < 0 && ids[p + w] === lab) { comp[p + w] = nc; stack[top++] = p + w; }
+        }
+        if (size < minPix) for (const p of members) ids[p] = 0;
+        nc++;
+      }
+      // grow the surrounding labels into the holes
+      for (let pass = 0; pass < 40; pass++) {
+        let left = 0; const next = ids.slice();
+        for (let p = 0; p < w * h; p++) {
+          if (ids[p]) continue;
+          const px = p % w;
+          const v = (px > 0 && ids[p - 1]) || (px < w - 1 && ids[p + 1]) || (p >= w && ids[p - w]) || (p + w < w * h && ids[p + w]) || 0;
+          if (v) next[p] = v; else left++;
+        }
+        ids = next;
+        if (!left) break;
       }
     }
-    if (x1 < 0) { self.postMessage({ type: "scanned", ms, fresh, shares: [] }); return; }
-    if (x1 - x0 > W / 2 || x1 >= W) { x0 = 0; x1 = W - 1; }   // the scan crossed the map's seam: send whole rows
-    const rw = x1 - x0 + 1, rh = y1 - y0 + 1, rect = new Uint8Array(rw * rh);
-    for (let y = 0; y < rh; y++) rect.set(world.subarray((y0 + y) * W + x0, (y0 + y) * W + x0 + rw), y * rw);
+    // into the room map. Every map pixel inside this picture's view looks itself up in the picture
+    // (the other way round leaves gaps, which showed as dotted stripes), then votes: a direction keeps
+    // its label until several scans say otherwise.
+    const put = (idx, id) => {
+      if (world[idx] === id) { if (conf[idx] < m.confMax) conf[idx]++; }
+      else if (conf[idx] > 1) conf[idx]--;
+      else { world[idx] = id; conf[idx] = 2; }
+    };
+    const dirOf = (tx, ty) => {
+      let dx = F[0] + R[0] * tx + U[0] * ty, dy = F[1] + R[1] * tx + U[1] * ty, dz = F[2] + R[2] * tx + U[2] * ty;
+      const l = 1 / Math.hypot(dx, dy, dz); return [dx * l, dy * l, dz * l];
+    };
+    // the picture's outline on the map, to know which map pixels to visit
+    let umin = 1, umax = 0, vmin = 1, vmax = 0;
+    const us = [];
+    for (let k = 0; k <= 32; k++) {
+      const f = k / 32;
+      for (const [a, b] of [[f, 0], [f, 1], [0, f], [1, f]]) {
+        const d = dirOf((a - 0.5) * 2 * th, (0.5 - b) * 2 * tv);
+        const u = Math.atan2(d[0], -d[2]) / (2 * Math.PI) + 0.5, v = Math.acos(Math.max(-1, Math.min(1, d[1]))) / Math.PI;
+        us.push(u); if (v < vmin) vmin = v; if (v > vmax) vmax = v;
+      }
+    }
+    // straight up / straight down inside the picture: the view covers a pole, so all of its rows
+    const seesPole = up => { const cz = up * F[1]; if (cz <= 0.05) return false;
+      const tx = up * R[1] / cz, ty = up * U[1] / cz; return Math.abs(tx) < th && Math.abs(ty) < tv; };
+    if (seesPole(1)) vmin = 0;
+    if (seesPole(-1)) vmax = 1;
+    us.sort((a, b) => a - b);
+    // the widest gap between outline points is where the picture is not: start just after it
+    let gapAt = 0, gap = us[0] + 1 - us[us.length - 1];
+    for (let i = 1; i < us.length; i++) if (us[i] - us[i - 1] > gap) { gap = us[i] - us[i - 1]; gapAt = i; }
+    const full = vmin === 0 || vmax === 1 || gap < 0.5;
+    const uStart = full ? 0 : us[gapAt], uSpan = full ? 1 : 1 - gap;
+    const y0 = Math.max(0, Math.floor(vmin * H) - 1), y1 = Math.min(H - 1, Math.ceil(vmax * H) + 1);
+    const xs = full ? 0 : Math.floor(uStart * W) - 1, xn = full ? W : Math.ceil(uSpan * W) + 3;
+    for (let Y = y0; Y <= y1; Y++) {
+      const phi = (Y + 0.5) / H * Math.PI, sp = Math.sin(phi), cp = Math.cos(phi);
+      for (let k = 0; k < xn; k++) {
+        const X = ((xs + k) % W + W) % W;
+        const az = ((X + 0.5) / W - 0.5) * 2 * Math.PI;
+        const dx = sp * Math.sin(az), dy = cp, dz = -sp * Math.cos(az);
+        const cz = dx * F[0] + dy * F[1] + dz * F[2];
+        if (cz <= 0.05) continue;
+        const tx = (dx * R[0] + dy * R[1] + dz * R[2]) / cz, ty = (dx * U[0] + dy * U[1] + dz * U[2]) / cz;
+        const x = (tx / (2 * th) + 0.5) * w, y = (0.5 - ty / (2 * tv)) * h;
+        if (x < 1 || y < 1 || x >= w - 1 || y >= h - 1) continue;
+        const id = ids[Math.floor(y) * w + Math.floor(x)];
+        if (id) put(Y * W + X, id);
+      }
+    }
+    // send back the changed rows (whole rows: simpler than cutting around the seam)
+    const rh = y1 - y0 + 1, rect = world.slice(y0 * W, (y1 + 1) * W);
+    const x0 = 0, rw = W;
     const total = w * h, shares = [...count].map(([k, n]) => [k, n / total]).sort((a, b) => b[1] - a[1]);
     self.postMessage({ type: "scanned", ms, fresh, shares, x: x0, y: y0, rw, rh, rect }, [rect.buffer]);
   } catch (e) {
@@ -755,7 +820,7 @@ async function scanOnce() {
     scanShot.width = w; scanShot.height = h;
     scanShot.getContext("2d").drawImage(vid, 0, 0, w, h);
     const bitmap = await createImageBitmap(scanShot);
-    await new Promise(res => { scanResolve = res; scanWorker.postMessage({ type: "scan", bitmap, w, h, R, U, F, th, tv }, [bitmap]); });
+    await new Promise(res => { scanResolve = res; scanWorker.postMessage({ type: "scan", bitmap, w, h, R, U, F, th, tv, minRegion: SCAN_MIN_REGION, confMax: SCAN_CONF_MAX }, [bitmap]); });
   } catch (e) {
     scanErr = String(e.message || e);
     document.getElementById("note").textContent = "スキャンできませんでした（" + scanErr + "）";
